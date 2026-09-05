@@ -25,9 +25,11 @@ elsewhere in this project is trained to correct for.
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 import numpy as np
 from pyproj import Geod
+from scipy.optimize import lsq_linear
 
 # Earth's angular velocity, rad/s. Used to compute the Coriolis
 # parameter f = 2 * Omega * sin(lat).
@@ -40,6 +42,42 @@ EARTH_ANGULAR_VELOCITY: float = 7.2921e-5
 # equatorial distance, and naive Euclidean lat/lon math would badly
 # distort both distances and bearings.
 _GEOD = Geod(ellps="WGS84")
+
+
+# The drift coefficients used when a caller does not pass its own.
+# main.py sets these to the values calibrated on the real record at
+# startup, so callers that cannot pass parameters explicitly -- notably
+# the frozen Dash frontend, which calls free_drift_velocity() with only
+# the five physical arguments -- still get the calibrated physics rather
+# than the literature defaults, which on this dataset are worse than
+# predicting nothing. Every training and evaluation path passes its
+# coefficients explicitly and is therefore unaffected by this global.
+_DEFAULT_PARAMS: dict[str, float] = {
+    "wind_factor": 0.018,
+    "deflection_deg": 20.0,
+    "current_factor": 1.0,
+}
+
+
+def set_default_drift_params(params: "DriftParams") -> None:
+    """Set the drift coefficients used when a caller passes none.
+
+    Args:
+        params: The calibrated coefficients to adopt as defaults.
+
+    Returns:
+        None.
+    """
+    _DEFAULT_PARAMS.update(params.as_kwargs())
+
+
+def get_default_drift_params() -> "DriftParams":
+    """Return the drift coefficients currently used as defaults.
+
+    Returns:
+        A DriftParams holding the current module-level defaults.
+    """
+    return DriftParams(**_DEFAULT_PARAMS)
 
 
 def coriolis_parameter(lat_deg: float) -> float:
@@ -63,13 +101,14 @@ def free_drift_velocity(
     u_current: float,
     v_current: float,
     lat_deg: float,
-    wind_factor: float = 0.018,
-    deflection_deg: float = 20.0,
+    wind_factor: float | None = None,
+    deflection_deg: float | None = None,
+    current_factor: float | None = None,
 ) -> tuple[float, float]:
     """Estimate iceberg drift velocity using the standard "free drift" approximation.
 
     iceberg velocity ~= wind_factor * R(deflection_angle) @ wind_vector
-                         + ocean_current_vector
+                         + current_factor * ocean_current_vector
 
     wind_factor (~0.018, i.e. ~1.8% of wind speed) is an empirical
     constant widely used in sea-ice/iceberg drift studies: wind drag on
@@ -89,9 +128,17 @@ def free_drift_velocity(
         lat_deg: Latitude in degrees, used only to determine the sign
             of the Coriolis deflection (not to scale its magnitude).
         wind_factor: Fraction of wind speed transferred to drift speed.
+            None uses the module default (see set_default_drift_params).
         deflection_deg: Magnitude of the Coriolis-driven deflection
             angle (degrees) between the wind vector and the resulting
-            wind-driven drift component.
+            wind-driven drift component. None uses the module default.
+        current_factor: Multiplier on the ocean current term. None uses
+            the module default. The
+            Copernicus product reports the current at ~0.5 m depth, but
+            a tabular iceberg's keel reaches 150-300 m down and is
+            dragged by the depth-averaged current, which is usually
+            weaker -- so a fitted value below 1.0 is physically
+            expected. See calibrate_free_drift_params().
 
     Returns:
         A (u_drift, v_drift) tuple in m/s, using the same
@@ -106,6 +153,13 @@ def free_drift_velocity(
     # by flipping the sign of the rotation angle using the sign of
     # lat_deg. At the equator the Coriolis effect vanishes, so
     # np.sign(0) == 0 correctly yields zero deflection.
+    if wind_factor is None:
+        wind_factor = _DEFAULT_PARAMS["wind_factor"]
+    if deflection_deg is None:
+        deflection_deg = _DEFAULT_PARAMS["deflection_deg"]
+    if current_factor is None:
+        current_factor = _DEFAULT_PARAMS["current_factor"]
+
     hemisphere_sign = np.sign(lat_deg)
     theta = math.radians(deflection_deg) * hemisphere_sign
 
@@ -115,8 +169,8 @@ def free_drift_velocity(
     u_wind_rot = cos_t * u_wind - sin_t * v_wind
     v_wind_rot = sin_t * u_wind + cos_t * v_wind
 
-    u_drift = wind_factor * u_wind_rot + u_current
-    v_drift = wind_factor * v_wind_rot + v_current
+    u_drift = wind_factor * u_wind_rot + current_factor * u_current
+    v_drift = wind_factor * v_wind_rot + current_factor * v_current
     return u_drift, v_drift
 
 
@@ -181,6 +235,233 @@ def geodesic_distance_km(lat1: float, lon1: float, lat2: float, lon2: float) -> 
     """
     _forward_azimuth, _back_azimuth, distance_m = _GEOD.inv(lon1, lat1, lon2, lat2)
     return distance_m / 1000.0
+
+
+
+@dataclass(frozen=True)
+class DriftParams:
+    """The three fitted coefficients of the free-drift baseline.
+
+    Attributes:
+        wind_factor: Fraction of 10 m wind speed transferred to drift.
+        deflection_deg: Coriolis deflection angle magnitude, degrees.
+        current_factor: Multiplier on the reported surface current.
+    """
+
+    wind_factor: float = 0.018
+    deflection_deg: float = 20.0
+    current_factor: float = 1.0
+
+    def as_kwargs(self) -> dict[str, float]:
+        """Return the parameters as keyword arguments for free_drift_velocity().
+
+        Returns:
+            A dict with wind_factor / deflection_deg / current_factor keys.
+        """
+        return {
+            "wind_factor": self.wind_factor,
+            "deflection_deg": self.deflection_deg,
+            "current_factor": self.current_factor,
+        }
+
+
+def free_drift_velocity_array(
+    u_wind: np.ndarray,
+    v_wind: np.ndarray,
+    u_current: np.ndarray,
+    v_current: np.ndarray,
+    lat_deg: np.ndarray,
+    wind_factor: float = 0.018,
+    deflection_deg: float = 20.0,
+    current_factor: float = 1.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Vectorized free_drift_velocity() over whole arrays of observations.
+
+    Identical physics to the scalar free_drift_velocity(), including the
+    hemisphere-dependent sign of the deflection, but evaluated with numpy
+    over every row at once. The real-data pipeline calls this on the full
+    pooled multi-iceberg table (and inside the calibration least-squares
+    loop, which evaluates it ~80 times), where a per-row .apply() would
+    dominate the runtime for no reason.
+
+    Args:
+        u_wind: Eastward 10 m wind components, m/s.
+        v_wind: Northward 10 m wind components, m/s.
+        u_current: Eastward surface current components, m/s.
+        v_current: Northward surface current components, m/s.
+        lat_deg: Latitudes in degrees, used only for the sign of the
+            deflection (broadcast against the other arrays).
+        wind_factor: Fraction of wind speed transferred to drift speed.
+        deflection_deg: Deflection angle magnitude, degrees.
+        current_factor: Multiplier on the ocean current term.
+
+    Returns:
+        A (u_drift, v_drift) tuple of numpy arrays in m/s.
+    """
+    # Same hemisphere flip as the scalar version: clockwise (negative
+    # rotation) in the Northern Hemisphere, counterclockwise in the
+    # Southern. np.sign gives 0 at the equator, where Coriolis vanishes.
+    theta = np.radians(deflection_deg) * np.sign(np.asarray(lat_deg, dtype=float))
+    cos_t, sin_t = np.cos(theta), np.sin(theta)
+
+    u_wind_rot = cos_t * u_wind - sin_t * v_wind
+    v_wind_rot = sin_t * u_wind + cos_t * v_wind
+
+    u_drift = wind_factor * u_wind_rot + current_factor * u_current
+    v_drift = wind_factor * v_wind_rot + current_factor * v_current
+    return u_drift, v_drift
+
+
+def calibrate_free_drift_params(
+    u_wind: np.ndarray,
+    v_wind: np.ndarray,
+    u_current: np.ndarray,
+    v_current: np.ndarray,
+    lat_deg: np.ndarray,
+    obs_u: np.ndarray,
+    obs_v: np.ndarray,
+    deflection_grid_deg: np.ndarray | None = None,
+    wind_factor_bounds: tuple[float, float] = (0.0, 0.05),
+    current_factor_bounds: tuple[float, float] = (0.0, 1.5),
+    tie_tolerance: float = 1e-2,
+) -> DriftParams:
+    """Fit wind_factor, current_factor and deflection_deg to observed drift.
+
+    The textbook values (1.8% of wind, 20 deg deflection, current taken
+    at face value) are generic sea-ice numbers. Refitting them on the
+    actual training icebergs is nearly free and moves a substantial
+    chunk of error out of the ML residual and into the physics term,
+    which is where we would much rather have it: the physics term
+    extrapolates to unseen icebergs and unseen regions, the tree
+    ensemble does not.
+
+    A WARNING THE ANTARCTIC DATA MAKES CONCRETE: the textbook 1.8%
+    wind factor assumes the current term is a GEOSTROPHIC current, which
+    contains no wind-driven flow. The Copernicus analysis product used
+    here reports the total modelled current at ~0.5 m depth, which
+    already includes the Ekman and Stokes response to the wind. Adding a
+    separate free-drift wind term on top therefore DOUBLE-COUNTS the
+    wind. On the real NIC record this shows up unmistakably: the
+    unconstrained wind factor comes out negative, and forcing it up to
+    even 0.005 makes the fit worse. Fitting the coefficients rather than
+    assuming them is what surfaces this instead of burying it in the ML
+    residual.
+
+    The fit exploits the fact that, for a FIXED deflection angle, the
+    free-drift model is *linear* in its two remaining coefficients:
+
+        [obs_u; obs_v] = wind_factor * R(theta) @ [u_wind; v_wind]
+                       + current_factor * [u_current; v_current]
+
+    So we grid-search only the one nonlinear parameter (theta) and solve
+    the other two exactly by ordinary least squares at each candidate,
+    stacking the u- and v-equations of every observation into one tall
+    system. That is both faster and far more robust than throwing all
+    three at a general-purpose optimizer with no good initial guess.
+
+    Args:
+        u_wind: Eastward wind components for each observation, m/s.
+        v_wind: Northward wind components, m/s.
+        u_current: Eastward current components, m/s.
+        v_current: Northward current components, m/s.
+        lat_deg: Latitudes, degrees (sets the deflection sign per row).
+        obs_u: Observed eastward drift velocities, m/s.
+        obs_v: Observed northward drift velocities, m/s.
+        deflection_grid_deg: Candidate deflection magnitudes to search.
+            Defaults to 0..40 degrees in 1-degree steps.
+        wind_factor_bounds: Physically admissible range for the wind
+            factor. Bounded below at 0 because an unconstrained fit can
+            return a NEGATIVE wind factor -- drift moving into the wind
+            -- when the wind term is weakly identified, which is
+            nonsense as physics and extrapolates disastrously.
+        current_factor_bounds: Admissible range for the current factor.
+        tie_tolerance: Relative error tolerance for the deflection
+            tie-break. When the wind factor fits near zero the deflection
+            angle is unidentifiable (rotating a near-zero vector changes
+            nothing), and an argmin over a flat surface returns an
+            arbitrary angle -- often pinned to the edge of the grid. Any
+            deflection within this relative tolerance of the best is
+            treated as tied, and the one closest to zero is chosen, so
+            the reported parameters are stable and honest about what the
+            data actually constrains. 1% of the sum of squares is well
+            inside the noise floor of a ~150-observation fit.
+
+    Returns:
+        The best-fitting DriftParams (lowest total squared velocity
+        error over the supplied observations, subject to the bounds).
+
+    Raises:
+        ValueError: If fewer than 3 finite observations are supplied
+            (two free coefficients cannot be fit from fewer points), or
+            if the inputs have mismatched lengths.
+    """
+    arrays = [np.asarray(a, dtype=float) for a in
+              (u_wind, v_wind, u_current, v_current, lat_deg, obs_u, obs_v)]
+    lengths = {a.shape for a in arrays}
+    if len(lengths) != 1:
+        raise ValueError(
+            f"calibrate_free_drift_params: all inputs must have the same shape, got {lengths}."
+        )
+    u_w, v_w, u_c, v_c, lat, o_u, o_v = arrays
+
+    finite = np.isfinite(np.column_stack(arrays)).all(axis=1)
+    if finite.sum() < 3:
+        raise ValueError(
+            f"calibrate_free_drift_params: need at least 3 finite observations to fit "
+            f"the two linear coefficients, got {int(finite.sum())}."
+        )
+    u_w, v_w, u_c, v_c, lat, o_u, o_v = (a[finite] for a in (u_w, v_w, u_c, v_c, lat, o_u, o_v))
+
+    if deflection_grid_deg is None:
+        # Symmetric by default: let the data choose the SIGN of the
+        # deflection rather than assuming our hemisphere convention is
+        # right. A fit that only makes sense at a negative angle is a
+        # signal that the convention is inverted somewhere.
+        deflection_grid_deg = np.arange(-40.0, 41.0, 1.0)
+
+    sign = np.sign(lat)
+    # Stacked target: every observation contributes two rows (u then v).
+    target = np.concatenate([o_u, o_v])
+
+    lower = np.array([wind_factor_bounds[0], current_factor_bounds[0]])
+    upper = np.array([wind_factor_bounds[1], current_factor_bounds[1]])
+
+    candidates: list[tuple[float, DriftParams]] = []
+    for deflection in np.asarray(deflection_grid_deg, dtype=float):
+        theta = np.radians(deflection) * sign
+        cos_t, sin_t = np.cos(theta), np.sin(theta)
+        wind_rot_u = cos_t * u_w - sin_t * v_w
+        wind_rot_v = sin_t * u_w + cos_t * v_w
+
+        # Design matrix: column 0 multiplies the rotated wind, column 1
+        # the reported current; the u- and v-equations are stacked.
+        design = np.column_stack(
+            [np.concatenate([wind_rot_u, wind_rot_v]), np.concatenate([u_c, v_c])]
+        )
+        result = lsq_linear(design, target, bounds=(lower, upper), method="bvls")
+        sse = float(np.sum((design @ result.x - target) ** 2))
+        candidates.append(
+            (
+                sse,
+                DriftParams(
+                    wind_factor=float(result.x[0]),
+                    deflection_deg=float(deflection),
+                    current_factor=float(result.x[1]),
+                ),
+            )
+        )
+
+    best_sse = min(sse for sse, _ in candidates)
+    # Among deflections the data cannot distinguish, prefer the smallest
+    # -- see tie_tolerance in the Args section. The threshold needs an
+    # absolute floor as well as a relative one: when the wind term fits
+    # to exactly zero every deflection gives the same fit, and a purely
+    # relative tolerance around a near-zero SSE would separate them on
+    # floating-point noise and hand back an arbitrary angle again.
+    scale = float(np.sum(target**2)) or 1.0
+    threshold = best_sse * (1.0 + tie_tolerance) + 1e-9 * scale
+    tied = [params for sse, params in candidates if sse <= threshold]
+    return min(tied, key=lambda p: abs(p.deflection_deg))
 
 
 if __name__ == "__main__":

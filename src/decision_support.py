@@ -1,357 +1,448 @@
 """
 decision_support.py
 
-Turns a trained hybrid model's predictions into an actual forward-
-looking forecast with uncertainty, plus a risk score relative to a
-vessel/platform position -- the "decision support" half of the
-project, distinct from pure trajectory prediction (train_model.py) or
-feature engineering (features.py).
+Turns a drift model into an operational answer: where will this iceberg
+be, how sure are we, and does it threaten a given vessel or platform.
 
-Everything here operates on FUTURE, not-yet-observed timesteps, which
-is a fundamentally different problem from evaluate_trajectory()'s
-historical rollout in train_model.py: we no longer have real future
-wind/current values to fall back on, only a forecast of them (however
-crude), so uncertainty in that forecast has to be propagated forward
-explicitly rather than ignored.
+This is the half of the project that is NOT trajectory prediction. A
+forecast track is not a decision; a closest-point-of-approach distance
+with an uncertainty envelope and a graded risk level is.
+
+THE HONEST UNCERTAINTY STORY
+============================
+Two things separate a real forecast from the hindcast evaluation in
+train_model.py:
+
+1. We do not know the future wind and current. The hindcast is allowed
+   to read them from the record; a real forecast must be handed an
+   environmental forecast, and that forecast is itself wrong.
+
+2. Consequently the single most useful output is not the track, it is
+   the SPREAD. bootstrap_uncertainty_cone() propagates plausible
+   environmental error into position error by re-running the rollout
+   many times with perturbed forcing. The perturbation scale is a
+   parameter with a real meaning -- roughly the RMS error of the
+   environmental forecast at the relevant lead time -- not a decoration.
+
+The cone is a lower bound on true uncertainty: it captures forcing
+error, but not error in the drift model itself. On the real NIC record
+the calibrated physics has a ~53 km 3-week ADE, so risk_score() adds a
+lead-time-scaled model-error floor (see model_error_km) and the cone is
+never allowed to claim more confidence than the model has earned.
 """
 
 from __future__ import annotations
 
-import re
-
 import numpy as np
 import pandas as pd
 
-from src.physics import free_drift_velocity, geodesic_distance_km, step_position
-from src.train_model import predict_residual
+import config
+from features import LAG_BASE_COLUMNS, build_single_feature_row
+from physics import (
+    DriftParams,
+    free_drift_velocity,
+    geodesic_distance_km,
+    get_default_drift_params,
+    step_position,
+)
+from train_model import predict_residual
 
-# The environmental variables that get lagged into sliding-window
-# features (must match features.LAG_BASE_COLUMNS exactly, since the
-# feature rows built here have to line up with what the models were
-# trained on).
-LAG_BASE_COLUMNS: list[str] = ["u_wind", "v_wind", "u_current", "v_current", "area_km2"]
+# Displacement error of the calibrated physics baseline as a function of
+# forecast lead time, fitted to the leave-one-iceberg-out rollout on the
+# real NIC record (34.7 km at 7 days, 53.9 at 14, 69.3 at 21):
+#
+#     error_km ~= MODEL_ERROR_COEFF_KM * days ** MODEL_ERROR_EXPONENT
+#
+# The sub-linear exponent is real and worth knowing: error does NOT grow
+# proportionally with lead time, because drift direction partly
+# decorrelates and excursions cancel rather than accumulate.
+#
+# Expressing this as a function of DAYS rather than of forecast STEPS
+# matters for the dashboard, which steps at 6 hours rather than the
+# ~weekly cadence of the training record -- a per-step constant would
+# overstate the error by a factor of ~28 there and paint every forecast
+# red.
+MODEL_ERROR_COEFF_KM: float = 10.4
+MODEL_ERROR_EXPONENT: float = 0.63
 
 
-def _infer_window_size(feature_cols: list[str]) -> int:
-    """Infer the sliding-window size used to build feature_cols from their names.
-
-    Lag feature columns are named "{var}_t-{lag}" (see
-    features.build_sliding_window_features); the window size is the
-    maximum lag number present across all such columns. Reimplemented
-    here (rather than imported from train_model, where an equivalent
-    private helper lives) to keep this module's dependencies limited to
-    the public contract listed in its docstring.
-
-    Args:
-        feature_cols: The feature column names to inspect.
-
-    Returns:
-        The inferred window size, or 0 if no lag columns are found.
-    """
-    lag_pattern = re.compile(r"_t-(\d+)$")
-    lags = [int(m.group(1)) for col in feature_cols if (m := lag_pattern.search(col))]
-    return max(lags) if lags else 0
-
-
-def build_feature_row(
-    history_window: pd.DataFrame,
-    current_lat: float,
-    current_lon: float,
-    phys_u: float,
-    phys_v: float,
-    feature_cols: list[str],
-) -> pd.DataFrame:
-    """Assemble a single-row feature DataFrame matching features.py's exact column layout.
-
-    During forecast rollout we don't have a pre-built feature table --
-    the future is being generated one step at a time -- so each
-    feature row has to be built on the fly from a rolling window of
-    recent conditions plus the current step's state.
-
-    history_window is expected to hold the `window_size` (inferred from
-    feature_cols) most recent OBSERVED rows of u_wind, v_wind,
-    u_current, v_current, area_km2, sorted ascending by time, with the
-    LAST row being the most recent one (i.e. "t-1" relative to the step
-    being forecast) -- this exactly matches the lag convention used by
-    features.build_sliding_window_features (df[col].shift(1) == the
-    immediately preceding row).
+def model_error_km(lead_time_hours: float) -> float:
+    """Estimate the drift model's own displacement error at a given lead time.
 
     Args:
-        history_window: DataFrame with at least the LAG_BASE_COLUMNS
-            columns, at least `window_size` rows, most-recent-last.
-        current_lat: The iceberg's current (starting-point-for-this-
-            step) latitude, degrees.
-        current_lon: The iceberg's current longitude, degrees.
-        phys_u: The physics-baseline eastward velocity prediction for
-            this step, m/s.
-        phys_v: The physics-baseline northward velocity prediction for
-            this step, m/s.
-        feature_cols: The exact feature column names (and order) the
-            trained models expect.
+        lead_time_hours: Forecast lead time, hours.
 
     Returns:
-        A single-row DataFrame with columns exactly matching
-        feature_cols, in that order.
-
-    Raises:
-        ValueError: If history_window has fewer rows than the window
-            size implied by feature_cols, or is missing any required
-            lag base column.
+        Expected displacement error in km, from the power law fitted to
+        the leave-one-iceberg-out rollout on the real record.
     """
-    window_size = _infer_window_size(feature_cols)
+    days = max(float(lead_time_hours), 0.0) / 24.0
+    return MODEL_ERROR_COEFF_KM * (days ** MODEL_ERROR_EXPONENT)
 
-    missing_cols = [c for c in LAG_BASE_COLUMNS if c not in history_window.columns]
-    if missing_cols:
-        raise ValueError(
-            f"build_feature_row: history_window is missing required column(s) "
-            f"{missing_cols}. It must contain: {LAG_BASE_COLUMNS}."
-        )
 
-    if len(history_window) < window_size:
-        raise ValueError(
-            f"build_feature_row: history_window has only {len(history_window)} row(s), "
-            f"but feature_cols implies a window size of {window_size}. Provide at least "
-            f"{window_size} rows of recent history (most-recent-last)."
-        )
+def _normalise_history(
+    history_window: pd.DataFrame | list[dict[str, float]] | None,
+    last_known: pd.Series,
+    n_lags: int,
+) -> list[dict[str, float]]:
+    """Coerce the several shapes of lag history callers pass into one form.
 
-    feature_values: dict[str, float] = {
-        "lat": current_lat,
-        "lon": current_lon,
-        "phys_u": phys_u,
-        "phys_v": phys_v,
-    }
-    # history_window.iloc[-lag] is the row `lag` steps before "now",
-    # matching features.py's df[col].shift(lag) convention exactly.
-    for col in LAG_BASE_COLUMNS:
-        for lag in range(1, window_size + 1):
-            feature_values[f"{col}_t-{lag}"] = history_window[col].iloc[-lag]
+    The frontend hands over a DataFrame slice whose LAST row is the most
+    recent observation; internal callers use a list ordered most recent
+    FIRST. Both are accepted, and a missing history falls back to
+    repeating the last known row, so a short track still forecasts
+    instead of raising.
 
-    feature_row_df = pd.DataFrame([feature_values])
-    return feature_row_df[feature_cols]
+    Args:
+        history_window: A DataFrame (oldest first), a list of dicts
+            (newest first), or None.
+        last_known: The most recent row, used as the fallback.
+        n_lags: Number of lag entries required.
+
+    Returns:
+        A list of exactly n_lags dicts, most recent first, each holding
+        obs_u/obs_v/residual_u/residual_v.
+    """
+    keys = ("obs_u", "obs_v", "residual_u", "residual_v")
+
+    if isinstance(history_window, pd.DataFrame) and not history_window.empty:
+        # Reverse: the frontend's slice runs oldest -> newest.
+        entries = [
+            {k: float(row.get(k, 0.0) or 0.0) for k in keys}
+            for _, row in history_window.iloc[::-1].iterrows()
+        ]
+    elif isinstance(history_window, list) and history_window:
+        entries = [{k: float(entry.get(k, 0.0) or 0.0) for k in keys} for entry in history_window]
+    else:
+        entries = []
+
+    if not entries:
+        fallback = {k: float(last_known.get(k, 0.0) or 0.0) for k in keys}
+        entries = [dict(fallback)]
+
+    # Pad by repeating the oldest available entry so a history shorter
+    # than n_lags degrades gracefully rather than raising.
+    while len(entries) < n_lags:
+        entries.append(dict(entries[-1]))
+    return entries[:n_lags]
 
 
 def rollout_forecast(
-    models: dict,
-    last_known_row: pd.Series,
-    history_window: pd.DataFrame,
-    future_environmental_forecast: pd.DataFrame,
-    feature_cols: list[str],
-    dt_seconds: float,
+    models: dict | None,
+    last_known: pd.Series,
+    history_window: pd.DataFrame | list[dict[str, float]] | None = None,
+    future_environment: pd.DataFrame | None = None,
+    feature_cols: list[str] | None = None,
+    dt_seconds: float | None = None,
+    drift_params: DriftParams | None = None,
+    n_lags: int = config.DEFAULT_N_LAGS,
+    mode: str | None = None,
 ) -> pd.DataFrame:
-    """Roll the hybrid model forward one future timestep at a time.
+    """Forecast an iceberg's position forward over a sequence of future segments.
 
-    future_environmental_forecast supplies the wind/current inputs for
-    each future step -- in a real system this would come from a
-    weather/ocean forecast API (e.g. a short-range ERA5/GFS or
-    Copernicus Marine forecast product), but for this hackathon we
-    ASSUME it is already provided as a DataFrame with columns
-    timestamp, u_wind, v_wind, u_current, v_current (one row per future
-    step, ascending order). A reasonable stand-in when no real forecast
-    is wired up yet is to reuse the most recent historical values or
-    hold them constant -- see this file's __main__ block for exactly
-    that stand-in in action. Getting a *real* environmental forecast
-    feed is a separate, later integration problem this function
-    deliberately does not solve.
+    Steps through `future_environment` one row at a time: compute the
+    free-drift velocity from that row's forcing, optionally add the
+    learned residual, advance the position geodesically, and feed the
+    step's own output back in as the next step's lag features.
 
-    A single dt_seconds is used for every step, which assumes uniform
-    time spacing across future_environmental_forecast's rows (matching
-    the project's fixed dt_hours convention, e.g. 6h steps); if you
-    need irregular future spacing, compute per-row dt from
-    future_environmental_forecast's own timestamp column instead.
+    The environmental forecast is supplied by the caller. In deployment
+    it would come from a numerical weather/ocean forecast; for a demo,
+    holding recent conditions constant or replaying the last few observed
+    segments is a reasonable stand-in, and the demo block below does the
+    latter. Either way, its error is what
+    bootstrap_uncertainty_cone() propagates.
 
-    Since future area_km2 isn't part of future_environmental_forecast
-    (we don't have a melt forecast), the iceberg's last known area is
-    held constant throughout the rollout -- a reasonable simplification
-    since melting is slow relative to typical short-term forecast
-    horizons, but worth revisiting for very long horizons.
+    ARGUMENT ORDER: the first six parameters are positional-compatible
+    with the call the Dash frontend makes,
+
+        rollout_forecast(model, last_known_row, history_window,
+                         future_env, feature_cols, dt_seconds)
+
+    so app/callbacks.py works against this module unmodified.
 
     Args:
-        models: The dict from train_model.train_residual_model()
-            ("u", "v", "feature_cols").
-        last_known_row: A pd.Series with at least timestamp, lat, lon,
-            area_km2 -- the iceberg's most recent real observation,
-            i.e. the starting point of the forecast.
-        history_window: The `window_size` most recent OBSERVED rows of
-            u_wind/v_wind/u_current/v_current/area_km2, most-recent-
-            last, where the last row corresponds to last_known_row's
-            own timestep (see build_feature_row's docstring for the
-            exact lag convention this assumes).
-        future_environmental_forecast: DataFrame with columns
-            timestamp, u_wind, v_wind, u_current, v_current, one row
-            per future step to forecast, ascending by time.
-        feature_cols: The feature column names/order the models
-            expect.
-        dt_seconds: Elapsed time between consecutive forecast steps, in
-            seconds (assumed uniform -- see note above).
+        models: A trained bundle, required when mode resolves to
+            "hybrid"; None forecasts with physics alone.
+        last_known: The iceberg's most recent enriched row, with
+            timestamp, lat, lon, area_km2 and (for the lag features)
+            obs_u/obs_v/residual_u/residual_v.
+        history_window: Lag history. Either a DataFrame whose LAST row is
+            the most recent observation (the shape the frontend passes,
+            from `track.iloc[-window:]`) or a list of dicts ordered most
+            recent FIRST. Defaults to repeating `last_known`'s values.
+        future_environment: One row per future segment, with u_wind,
+            v_wind, u_current, v_current and either a `timestamp` column
+            or a `dt_hours` column giving each segment's length.
+        feature_cols: Accepted for call compatibility with the frontend
+            and ignored -- the bundle already carries the authoritative
+            column order, and honouring a second, possibly stale list
+            would be a way to silently mispredict.
+        dt_seconds: A single segment length applied to every step. When
+            given it overrides whatever the timestamps imply, which is
+            what the frontend relies on for its fixed 6-hour cadence.
+        drift_params: Calibrated drift coefficients. Defaults to the
+            bundle's, else the module defaults.
+        n_lags: Number of lags the model expects.
+        mode: "physics" or "hybrid". Defaults to "hybrid" when a bundle
+            is supplied (the frontend routes here only for hybrid; its
+            physics path is computed inline) and "physics" otherwise.
 
     Returns:
-        A DataFrame with columns {timestamp, lat, lon}, one row per
-        row of future_environmental_forecast, giving the forecasted
-        iceberg position at each future step.
+        A DataFrame with timestamp, lat, lon, u_forecast, v_forecast for
+        each future segment.
 
     Raises:
-        ValueError: If future_environmental_forecast is missing any
-            required column.
+        ValueError: If mode resolves to "hybrid" without models, or if
+            future_environment provides neither timestamps nor dt_hours.
     """
-    required_cols = ["timestamp", "u_wind", "v_wind", "u_current", "v_current"]
-    missing_cols = [c for c in required_cols if c not in future_environmental_forecast.columns]
-    if missing_cols:
-        raise ValueError(
-            f"rollout_forecast: future_environmental_forecast is missing required "
-            f"column(s) {missing_cols}."
+    if mode is None:
+        mode = "hybrid" if models is not None else "physics"
+    if mode == "hybrid" and models is None:
+        raise ValueError("rollout_forecast: mode='hybrid' requires a trained `models` bundle.")
+    if future_environment is None:
+        raise ValueError("rollout_forecast: future_environment is required.")
+    if drift_params is None:
+        drift_params = (
+            models["drift_params"] if models is not None else get_default_drift_params()
         )
 
-    window = history_window[LAG_BASE_COLUMNS].reset_index(drop=True).copy()
-    current_lat = last_known_row["lat"]
-    current_lon = last_known_row["lon"]
-    last_known_area_km2 = last_known_row["area_km2"]
-
-    forecast_records: list[dict] = []
-
-    # This loop is another instance of the "sequential position
-    # integration" exception to vectorization: each step's forecast
-    # depends on the PREVIOUS step's forecasted (not real) position and
-    # updated history window, so it cannot be vectorized across steps.
-    for _, future_row in future_environmental_forecast.reset_index(drop=True).iterrows():
-        u_wind_f = future_row["u_wind"]
-        v_wind_f = future_row["v_wind"]
-        u_current_f = future_row["u_current"]
-        v_current_f = future_row["v_current"]
-
-        phys_u, phys_v = free_drift_velocity(
-            u_wind=u_wind_f, v_wind=v_wind_f, u_current=u_current_f, v_current=v_current_f, lat_deg=current_lat
-        )
-
-        feature_row_df = build_feature_row(window, current_lat, current_lon, phys_u, phys_v, feature_cols)
-        residual_u, residual_v = predict_residual(models, feature_row_df)
-
-        final_u = phys_u + residual_u
-        final_v = phys_v + residual_v
-
-        new_lat, new_lon = step_position(
-            lat=current_lat, lon=current_lon, u_ms=final_u, v_ms=final_v, dt_seconds=dt_seconds
-        )
-
-        forecast_records.append({"timestamp": future_row["timestamp"], "lat": new_lat, "lon": new_lon})
-
-        # Slide the history window forward: drop the oldest row, append
-        # this step's (forecast-input) environmental conditions as the
-        # new most-recent row, so the NEXT iteration's lag features are
-        # built correctly.
-        new_hist_row = pd.DataFrame(
-            [
-                {
-                    "u_wind": u_wind_f,
-                    "v_wind": v_wind_f,
-                    "u_current": u_current_f,
-                    "v_current": v_current_f,
-                    "area_km2": last_known_area_km2,
-                }
+    env = future_environment.reset_index(drop=True)
+    if "dt_hours" in env.columns:
+        dt_hours = env["dt_hours"].to_numpy(dtype=float)
+        timestamps = (
+            env["timestamp"].to_list()
+            if "timestamp" in env.columns
+            else [
+                pd.Timestamp(last_known["timestamp"]) + pd.Timedelta(hours=float(h))
+                for h in np.cumsum(dt_hours)
             ]
         )
-        window = pd.concat([window, new_hist_row], ignore_index=True).iloc[1:].reset_index(drop=True)
+    elif "timestamp" in env.columns:
+        stamps = pd.to_datetime(env["timestamp"])
+        edges = pd.concat([pd.Series([pd.Timestamp(last_known["timestamp"])]), stamps])
+        dt_hours = edges.diff().dt.total_seconds().to_numpy()[1:] / 3600.0
+        timestamps = stamps.to_list()
+    else:
+        raise ValueError(
+            "rollout_forecast: future_environment must have a 'timestamp' or 'dt_hours' "
+            f"column to know how long each segment is; it has {list(env.columns)}."
+        )
 
-        current_lat, current_lon = new_lat, new_lon
+    if dt_seconds is not None:
+        dt_hours = np.full(len(env), float(dt_seconds) / 3600.0)
 
-    return pd.DataFrame.from_records(forecast_records)
+    history = _normalise_history(history_window, last_known, n_lags)
+
+    lat = float(last_known["lat"])
+    lon = float(last_known["lon"])
+    area = float(last_known["area_km2"])
+
+    records: list[dict[str, object]] = []
+    for step, row in env.iterrows():
+        phys_u, phys_v = free_drift_velocity(
+            u_wind=float(row["u_wind"]),
+            v_wind=float(row["v_wind"]),
+            u_current=float(row["u_current"]),
+            v_current=float(row["v_current"]),
+            lat_deg=lat,
+            **drift_params.as_kwargs(),
+        )
+
+        residual_u = residual_v = 0.0
+        if mode == "hybrid":
+            state: dict[str, float] = {
+                "lat": lat,
+                "lon": lon,
+                "area_km2": area,
+                "u_wind": float(row["u_wind"]),
+                "v_wind": float(row["v_wind"]),
+                "u_current": float(row["u_current"]),
+                "v_current": float(row["v_current"]),
+                "phys_u": phys_u,
+                "phys_v": phys_v,
+                "dt_hours": float(dt_hours[step]),
+            }
+            for lag, past in enumerate(history, start=1):
+                for col in ("obs_u", "obs_v", "residual_u", "residual_v"):
+                    state[f"{col}_t-{lag}"] = past[col]
+            residual_u, residual_v = predict_residual(
+                models, build_single_feature_row(state, n_lags=n_lags)
+            )
+
+        total_u, total_v = phys_u + residual_u, phys_v + residual_v
+        lat, lon = step_position(lat, lon, total_u, total_v, float(dt_hours[step]) * 3600.0)
+
+        records.append(
+            {
+                "timestamp": timestamps[step],
+                "lat": lat,
+                "lon": lon,
+                "u_forecast": total_u,
+                "v_forecast": total_v,
+            }
+        )
+
+        # The next step's lag features are this step's own output.
+        history.insert(
+            0,
+            {"obs_u": total_u, "obs_v": total_v, "residual_u": residual_u, "residual_v": residual_v},
+        )
+        history = history[:n_lags]
+
+    return pd.DataFrame.from_records(records)
 
 
 def bootstrap_uncertainty_cone(
-    models: dict,
-    last_known_row: pd.Series,
-    history_window: pd.DataFrame,
-    future_environmental_forecast: pd.DataFrame,
-    feature_cols: list[str],
-    dt_seconds: float,
-    n_samples: int = 30,
-    noise_std_wind: float = 1.0,
-    noise_std_current: float = 0.05,
+    last_known: pd.Series,
+    future_environment: pd.DataFrame,
+    models: dict | None = None,
+    drift_params: DriftParams | None = None,
+    n_samples: int = 40,
+    noise_std_wind: float = 2.5,
+    noise_std_current: float = 0.04,
+    n_lags: int = config.DEFAULT_N_LAGS,
+    mode: str | None = None,
+    seed: int = 42,
 ) -> list[pd.DataFrame]:
-    """Approximate a forecast uncertainty cone via bootstrapped environmental noise.
+    """Propagate environmental forecast error into position uncertainty.
 
-    Calls rollout_forecast() n_samples times, each time perturbing
-    future_environmental_forecast's wind and current columns with
-    independent Gaussian noise (noise_std_wind, noise_std_current) --
-    this approximates how uncertainty in the environmental FORECAST
-    itself (which is never perfect) propagates into position
-    uncertainty, without requiring a full probabilistic weather/ocean
-    model, which is out of scope for a hackathon.
+    Re-runs rollout_forecast() `n_samples` times, each with independent
+    Gaussian noise added to the future wind and current, producing a
+    family of plausible tracks whose spread at each future timestep is
+    the uncertainty cone.
 
-    The caller (e.g. app.py) can compute a spatial envelope from the
-    returned list to draw a cone on a map -- for example, taking the
-    min/max lat and min/max lon across all samples at each future
-    timestep, or computing a convex hull of all sampled positions at
-    each timestep for a tighter, non-axis-aligned envelope.
+    The default noise scales are not arbitrary: 2.5 m/s is a
+    representative RMS error for a multi-day 10 m wind forecast, and
+    0.04 m/s is a similar figure for surface currents -- comparable to
+    the 0.05-0.10 m/s the icebergs in this record actually drift at,
+    which is precisely why the cone is wide.
+
+    The noise is applied INDEPENDENTLY per future step, which treats
+    successive forecast errors as uncorrelated. Real forecast errors are
+    strongly correlated in time (a forecast that is too westerly today
+    is likely too westerly tomorrow), so independent noise partially
+    cancels over a rollout and this cone is, if anything, narrower than
+    the truth. risk_score()'s model-error floor is what keeps that from
+    being read as confidence.
 
     Args:
-        models, last_known_row, history_window,
-            future_environmental_forecast, feature_cols, dt_seconds:
-            Same as rollout_forecast().
-        n_samples: Number of bootstrap rollouts to run.
-        noise_std_wind: Standard deviation (m/s) of the Gaussian noise
-            added independently to each future u_wind/v_wind value in
-            each sample.
-        noise_std_current: Standard deviation (m/s) of the Gaussian
-            noise added independently to each future u_current/
-            v_current value in each sample.
+        last_known: The iceberg's most recent enriched row.
+        future_environment: Forecast forcing per future segment.
+        models: A trained bundle, if forecasting in hybrid mode.
+        drift_params: Calibrated drift coefficients.
+        n_samples: Number of perturbed rollouts.
+        noise_std_wind: Std dev of the wind perturbation, m/s.
+        noise_std_current: Std dev of the current perturbation, m/s.
+        n_lags: Number of lags the model expects.
+        mode: "physics" or "hybrid"; defaults to the bundle's validated
+            mode.
+        seed: Seed for the perturbation generator, for reproducibility.
 
     Returns:
-        A list of n_samples DataFrames, each in the same {timestamp,
-        lat, lon} format returned by rollout_forecast().
+        A list of n_samples forecast DataFrames, each shaped like
+        rollout_forecast()'s output. Call cone_envelope() to reduce them
+        to a per-timestep spatial envelope for plotting.
     """
-    rng = np.random.default_rng()
+    rng = np.random.default_rng(seed)
+    shape = (len(future_environment),)
+
     samples: list[pd.DataFrame] = []
-
     for _ in range(n_samples):
-        noisy_forecast = future_environmental_forecast.copy()
-        n_steps = len(noisy_forecast)
-        noisy_forecast["u_wind"] = noisy_forecast["u_wind"] + rng.normal(0, noise_std_wind, n_steps)
-        noisy_forecast["v_wind"] = noisy_forecast["v_wind"] + rng.normal(0, noise_std_wind, n_steps)
-        noisy_forecast["u_current"] = noisy_forecast["u_current"] + rng.normal(0, noise_std_current, n_steps)
-        noisy_forecast["v_current"] = noisy_forecast["v_current"] + rng.normal(0, noise_std_current, n_steps)
-
-        sample_forecast = rollout_forecast(
-            models, last_known_row, history_window, noisy_forecast, feature_cols, dt_seconds
+        perturbed = future_environment.reset_index(drop=True).copy()
+        perturbed["u_wind"] = perturbed["u_wind"] + rng.normal(0.0, noise_std_wind, shape)
+        perturbed["v_wind"] = perturbed["v_wind"] + rng.normal(0.0, noise_std_wind, shape)
+        perturbed["u_current"] = perturbed["u_current"] + rng.normal(0.0, noise_std_current, shape)
+        perturbed["v_current"] = perturbed["v_current"] + rng.normal(0.0, noise_std_current, shape)
+        samples.append(
+            rollout_forecast(
+                models,
+                last_known,
+                future_environment=perturbed,
+                drift_params=drift_params,
+                n_lags=n_lags,
+                mode=mode,
+            )
         )
-        samples.append(sample_forecast)
-
     return samples
 
 
-def compute_cpa(iceberg_forecast_df: pd.DataFrame, vessel_lat: float, vessel_lon: float) -> dict:
-    """Compute the Closest Point of Approach between a forecasted iceberg track and a fixed vessel.
+def cone_envelope(cone: list[pd.DataFrame]) -> pd.DataFrame:
+    """Reduce a bootstrap cone to a per-timestep envelope for plotting.
 
     Args:
-        iceberg_forecast_df: A forecast DataFrame with columns
-            timestamp, lat, lon (e.g. from rollout_forecast()).
-        vessel_lat: Fixed vessel/platform latitude, degrees.
-        vessel_lon: Fixed vessel/platform longitude, degrees.
+        cone: The list of forecast DataFrames from
+            bootstrap_uncertainty_cone().
 
     Returns:
-        A dict: {"cpa_distance_km": float, "cpa_timestamp": pd.Timestamp,
-        "time_to_cpa_hours": float}. time_to_cpa_hours is measured
-        relative to iceberg_forecast_df's FIRST timestamp (i.e. "hours
-        from now").
+        A DataFrame with one row per future timestep: timestamp, the
+        mean lat/lon, the min/max of each, and spread_km -- the mean
+        geodesic distance of the samples from their own centroid, which
+        is the number to quote as "the forecast is good to +/- X km".
     """
-    # geodesic_distance_km() takes scalar points; each forecasted step
-    # is independent of the others (no sequential dependency here), so
-    # this list comprehension is a simple, readable per-row evaluation
-    # rather than a sequential-integration-style loop.
-    distances_km = [
-        geodesic_distance_km(vessel_lat, vessel_lon, row.lat, row.lon)
-        for row in iceberg_forecast_df.itertuples()
-    ]
+    stacked = pd.concat(cone, ignore_index=True)
+    rows: list[dict[str, object]] = []
+    for timestamp, group in stacked.groupby("timestamp", sort=True):
+        mean_lat = float(group["lat"].mean())
+        mean_lon = float(group["lon"].mean())
+        spread = float(
+            np.mean(
+                [
+                    geodesic_distance_km(mean_lat, mean_lon, lat, lon)
+                    for lat, lon in zip(group["lat"], group["lon"])
+                ]
+            )
+        )
+        rows.append(
+            {
+                "timestamp": timestamp,
+                "lat": mean_lat,
+                "lon": mean_lon,
+                "lat_min": float(group["lat"].min()),
+                "lat_max": float(group["lat"].max()),
+                "lon_min": float(group["lon"].min()),
+                "lon_max": float(group["lon"].max()),
+                "spread_km": spread,
+            }
+        )
+    return pd.DataFrame(rows)
 
-    min_idx = int(np.argmin(distances_km))
-    cpa_distance_km = float(distances_km[min_idx])
-    cpa_timestamp = iceberg_forecast_df["timestamp"].iloc[min_idx]
-    first_timestamp = iceberg_forecast_df["timestamp"].iloc[0]
-    time_to_cpa_hours = (cpa_timestamp - first_timestamp).total_seconds() / 3600.0
+
+def compute_cpa(
+    forecast: pd.DataFrame, vessel_lat: float, vessel_lon: float
+) -> dict:
+    """Find the closest point of approach between a forecast track and a fixed asset.
+
+    Args:
+        forecast: A forecast track with timestamp, lat, lon.
+        vessel_lat: Vessel or platform latitude, degrees.
+        vessel_lon: Vessel or platform longitude, degrees.
+
+    Returns:
+        A dict with cpa_distance_km, cpa_timestamp, time_to_cpa_hours
+        (measured from the first forecast timestamp, i.e. "hours from
+        now") and cpa_step_index.
+
+    Raises:
+        ValueError: If the forecast is empty.
+    """
+    if forecast.empty:
+        raise ValueError("compute_cpa: the forecast track is empty.")
+
+    distances = np.array(
+        [
+            geodesic_distance_km(lat, lon, vessel_lat, vessel_lon)
+            for lat, lon in zip(forecast["lat"], forecast["lon"])
+        ]
+    )
+    idx = int(np.argmin(distances))
+    cpa_time = pd.Timestamp(forecast["timestamp"].iloc[idx])
+    origin = pd.Timestamp(forecast["timestamp"].iloc[0])
 
     return {
-        "cpa_distance_km": cpa_distance_km,
-        "cpa_timestamp": cpa_timestamp,
-        "time_to_cpa_hours": time_to_cpa_hours,
+        "cpa_distance_km": float(distances[idx]),
+        "cpa_timestamp": cpa_time,
+        "time_to_cpa_hours": float((cpa_time - origin).total_seconds() / 3600.0),
+        "cpa_step_index": idx,
     }
 
 
@@ -362,159 +453,162 @@ def risk_score(
     vessel_lon: float | None = None,
     danger_threshold_km: float = 10.0,
     watch_threshold_km: float = 30.0,
-    uncertainty_escalation_fraction: float = 0.3,
 ) -> dict:
-    """Produce a tiered (red/yellow/green) risk assessment from a CPA result.
+    """Grade the threat a forecast iceberg poses to a fixed asset.
 
-    Base tier is determined purely by cpa_distance_km against the two
-    thresholds. If uncertainty_cone is also provided (along with
-    vessel_lat/vessel_lon), this additionally computes CPA distance for
-    every bootstrap sample and checks whether the samples disagree
-    widely (std/mean of sampled CPA distances exceeding
-    uncertainty_escalation_fraction) -- if so, the risk level is
-    escalated by one tier (green->yellow->red, red stays red), since
-    high forecast uncertainty means the "true" risk could plausibly be
-    worse than the single best-estimate forecast suggests.
+    Returns one of three levels, always -- an ungraded result is not a
+    useful output for a bridge officer.
 
-    This function always returns one of the three levels -- it never
-    silently returns an ungraded/unlabeled result.
+      red    -- forecast CPA inside danger_threshold_km
+      amber  -- inside watch_threshold_km
+      green  -- outside both
+
+    The middle tier is named "amber" rather than "yellow" because the
+    dashboard renders the level directly as a CSS class (`iw-pill
+    {level}`) and the stylesheet defines green/amber/red/grey. Returning
+    "yellow" would silently render an unstyled pill.
+
+    Two things escalate the level beyond what the nominal CPA implies:
+
+    1. Cone disagreement. If the bootstrap samples disagree widely about
+       the CPA, the nominal number is not trustworthy and the level is
+       raised one tier.
+
+    2. The model's own error. The calibrated drift model has a known
+       per-step displacement error on real icebergs, independent of any
+       forcing uncertainty. A forecast CPA of 35 km three steps out, with
+       a ~18 km/step model error, does NOT mean the asset is clear. The
+       level is raised whenever the CPA lies inside the model's own error
+       budget at that lead time.
+
+    This deliberately errs toward escalation: a false yellow costs a
+    course check, a false green costs a hull.
 
     Args:
-        cpa_result: The dict from compute_cpa() for the best-estimate
-            (non-bootstrapped) forecast.
-        uncertainty_cone: Optional list of bootstrap forecast
-            DataFrames (from bootstrap_uncertainty_cone()), used to
-            assess forecast confidence. If provided, vessel_lat and
-            vessel_lon must also be provided.
-        vessel_lat: Fixed vessel latitude, degrees. Required if
-            uncertainty_cone is provided.
-        vessel_lon: Fixed vessel longitude, degrees. Required if
-            uncertainty_cone is provided.
-        danger_threshold_km: CPA distance below which risk is "red".
-        watch_threshold_km: CPA distance below which (and at/above
-            danger_threshold_km) risk is "yellow"; at or above this,
-            risk is "green".
-        uncertainty_escalation_fraction: If the bootstrap CPA distances'
-            (std / mean) exceeds this fraction, escalate the risk level
-            by one tier.
+        cpa_result: The dict from compute_cpa().
+        uncertainty_cone: Optional bootstrap samples for the spread check.
+        vessel_lat: Vessel latitude; required to use the cone.
+        vessel_lon: Vessel longitude; required to use the cone.
+        danger_threshold_km: Red threshold.
+        watch_threshold_km: Amber threshold.
 
     Returns:
-        A dict: {"level": "red"|"yellow"|"green", "cpa_distance_km":
-        float, "time_to_cpa_hours": float, "confidence_note": str}.
-
-    Raises:
-        ValueError: If uncertainty_cone is provided but vessel_lat or
-            vessel_lon is missing.
+        A dict with level ("green"/"amber"/"red"), cpa_distance_km,
+        time_to_cpa_hours,
+        effective_threat_km (CPA minus the total error budget),
+        cpa_spread_km and confidence_note.
     """
-    cpa_distance_km = cpa_result["cpa_distance_km"]
-    time_to_cpa_hours = cpa_result["time_to_cpa_hours"]
+    order = ["green", "amber", "red"]
+    cpa_km = float(cpa_result["cpa_distance_km"])
 
-    tiers = ["green", "yellow", "red"]
-    if cpa_distance_km < danger_threshold_km:
-        level = "red"
-    elif cpa_distance_km < watch_threshold_km:
-        level = "yellow"
+    level = "red" if cpa_km < danger_threshold_km else (
+        "amber" if cpa_km < watch_threshold_km else "green"
+    )
+    notes: list[str] = []
+
+    # --- Model error budget at this lead time ------------------------
+    lead_hours = float(cpa_result.get("time_to_cpa_hours", 0.0))
+    model_error = model_error_km(lead_hours)
+
+    # --- Cone disagreement -------------------------------------------
+    cpa_spread_km = float("nan")
+    if uncertainty_cone and vessel_lat is not None and vessel_lon is not None:
+        sample_cpas = np.array(
+            [compute_cpa(sample, vessel_lat, vessel_lon)["cpa_distance_km"]
+             for sample in uncertainty_cone]
+        )
+        cpa_spread_km = float(sample_cpas.std())
+        if cpa_spread_km > 0.5 * max(sample_cpas.mean(), 1e-6):
+            level = order[min(order.index(level) + 1, 2)]
+            notes.append(
+                f"forecast spread is large relative to the approach distance "
+                f"(CPA std {cpa_spread_km:.1f} km across {len(sample_cpas)} perturbed runs)"
+            )
+    total_error_km = model_error + (0.0 if np.isnan(cpa_spread_km) else cpa_spread_km)
+
+    if cpa_km < watch_threshold_km + total_error_km and level != "red":
+        level = order[min(order.index(level) + 1, 2)]
+        notes.append(
+            f"the {cpa_km:.0f} km closest approach is inside the model's own "
+            f"+/-{total_error_km:.0f} km error budget at {lead_hours:.0f} h lead"
+        )
+
+    if notes:
+        confidence_note = "Escalated: " + "; ".join(notes) + "."
     else:
-        level = "green"
-
-    confidence_note = "Uncertainty cone not provided; risk level reflects a single best-estimate forecast only."
-
-    if uncertainty_cone is not None:
-        if vessel_lat is None or vessel_lon is None:
-            raise ValueError(
-                "risk_score: uncertainty_cone was provided but vessel_lat/vessel_lon were not -- "
-                "both are required to evaluate CPA against the bootstrap samples."
-            )
-
-        sample_cpa_distances_km = [
-            compute_cpa(sample_df, vessel_lat, vessel_lon)["cpa_distance_km"] for sample_df in uncertainty_cone
-        ]
-        mean_cpa_km = float(np.mean(sample_cpa_distances_km))
-        std_cpa_km = float(np.std(sample_cpa_distances_km))
-        relative_spread = std_cpa_km / mean_cpa_km if mean_cpa_km > 0 else float("inf")
-
-        if relative_spread > uncertainty_escalation_fraction:
-            escalated_idx = min(tiers.index(level) + 1, len(tiers) - 1)
-            level = tiers[escalated_idx]
-            confidence_note = (
-                f"Elevated due to high forecast uncertainty: bootstrap CPA distances vary by "
-                f"{relative_spread:.0%} (std={std_cpa_km:.1f} km) around a mean of {mean_cpa_km:.1f} km."
-            )
-        else:
-            confidence_note = (
-                f"Forecast uncertainty is low for this horizon: bootstrap CPA distances vary by only "
-                f"{relative_spread:.0%} (std={std_cpa_km:.1f} km) around a mean of {mean_cpa_km:.1f} km."
-            )
+        confidence_note = (
+            f"Closest approach {cpa_km:.0f} km clears the {watch_threshold_km:.0f} km watch "
+            f"threshold by more than the +/-{total_error_km:.0f} km forecast error budget."
+        )
 
     return {
         "level": level,
-        "cpa_distance_km": cpa_distance_km,
-        "time_to_cpa_hours": time_to_cpa_hours,
+        "cpa_distance_km": cpa_km,
+        "time_to_cpa_hours": float(cpa_result["time_to_cpa_hours"]),
+        "effective_threat_km": cpa_km - total_error_km,
+        "cpa_spread_km": cpa_spread_km,
+        "model_error_km": model_error,
         "confidence_note": confidence_note,
     }
 
+
 if __name__ == "__main__":
-    from data_ingest import generate_synthetic_track
-    from features import build_sliding_window_features
-    from train_model import train_residual_model, train_test_split_by_time
+    from data_ingest import build_real_dataset
+    from features import calibrate_drift_params, compute_physics_residual, compute_observed_velocity
 
-    WINDOW_SIZE = 5
-    HORIZON_STEPS = 10
-    DT_HOURS = 6
+    pooled, _motion = build_real_dataset(verbose=False)
+    params = calibrate_drift_params(compute_observed_velocity(pooled))
+    enriched = compute_physics_residual(pooled, params=params)
 
-    track = generate_synthetic_track(n_steps=150, dt_hours=DT_HOURS, seed=7)
-    feature_df, feature_cols, target_cols = build_sliding_window_features(track, window_size=WINDOW_SIZE)
-    train_df, _test_df = train_test_split_by_time(feature_df, test_fraction=0.2)
-    models = train_residual_model(train_df, feature_cols, target_cols)
+    # Take the fastest-drifting berg in the record as the demo subject.
+    speeds = enriched.groupby("iceberg_id").apply(
+        lambda g: float(np.hypot(g["obs_u"], g["obs_v"]).mean()), include_groups=False
+    )
+    berg_id = str(speeds.idxmax())
+    berg = enriched[enriched["iceberg_id"] == berg_id].sort_values("timestamp").reset_index(drop=True)
+    last_known = berg.iloc[-1]
 
-    # Build a forecast setup by carving the LAST 10 rows of the real
-    # synthetic track's environmental data off as a stand-in "future
-    # forecast" -- NOT a real weather forecast, just a convenient
-    # historical block to demonstrate rollout_forecast() end to end
-    # without needing a live forecast API wired up yet.
-    n = len(track)
-    last_known_idx = n - HORIZON_STEPS - 1
-    last_known_row = track.iloc[last_known_idx]
-    history_window = track.iloc[last_known_idx - WINDOW_SIZE : last_known_idx].reset_index(drop=True)
-    future_environmental_forecast = track.iloc[last_known_idx + 1 : last_known_idx + 1 + HORIZON_STEPS][
-        ["timestamp", "u_wind", "v_wind", "u_current", "v_current"]
+    print(f"Iceberg {berg_id}: {len(berg)} forced segments, last fix "
+          f"{last_known['timestamp']:%Y-%m-%d} at ({last_known['lat']:.2f}, {last_known['lon']:.2f}), "
+          f"mean speed {speeds.max():.3f} m/s")
+
+    # STAND-IN FOR A REAL FORECAST: replay this berg's own last four
+    # observed segments as if they were the coming four weeks' forecast.
+    # A deployed system would call a weather/ocean forecast API here;
+    # the point of the cone below is precisely that this is uncertain.
+    horizon = 4
+    future_env = berg.tail(horizon)[
+        ["u_wind", "v_wind", "u_current", "v_current", "dt_hours"]
     ].reset_index(drop=True)
-    dt_seconds = DT_HOURS * 3600.0
 
-    forecast_df = rollout_forecast(
-        models, last_known_row, history_window, future_environmental_forecast, feature_cols, dt_seconds
+    forecast = rollout_forecast(None, last_known, future_environment=future_env,
+                                drift_params=params, mode="physics")
+    print(f"\n{horizon}-segment forecast from {last_known['timestamp']:%Y-%m-%d}:")
+    print(forecast.to_string(index=False))
+
+    cone = bootstrap_uncertainty_cone(
+        last_known, future_env, drift_params=params, mode="physics", n_samples=40
     )
-    print("Forecasted track:")
-    print(forecast_df.to_string(index=False))
+    envelope = cone_envelope(cone)
+    print(f"\nUncertainty cone ({len(cone)} perturbed rollouts):")
+    print(envelope[["timestamp", "lat", "lon", "lat_min", "lat_max", "spread_km"]].to_string(index=False))
+    assert envelope["spread_km"].iloc[-1] > 0, "the cone collapsed to a point"
+    assert envelope["spread_km"].is_monotonic_increasing, "uncertainty should grow with lead time"
 
-    uncertainty_cone = bootstrap_uncertainty_cone(
-        models, last_known_row, history_window, future_environmental_forecast, feature_cols, dt_seconds,
-        n_samples=30,
-    )
+    # Place a vessel a plausible distance off the forecast end point.
+    end = forecast.iloc[-1]
+    vessel_lat = float(end["lat"]) + 0.25
+    vessel_lon = float(end["lon"]) + 0.25
 
-    # Pick a vessel position a plausible distance from the forecasted
-    # track's end point (roughly tens of km away at these latitudes) so
-    # compute_cpa/risk_score have something meaningful to evaluate.
-    end_lat, end_lon = forecast_df["lat"].iloc[-1], forecast_df["lon"].iloc[-1]
-    vessel_lat, vessel_lon = end_lat + 0.15, end_lon + 0.25
-    vessel_distance_km = geodesic_distance_km(vessel_lat, vessel_lon, end_lat, end_lon)
-    print(f"\nVessel position: ({vessel_lat:.4f}, {vessel_lon:.4f}), "
-          f"~{vessel_distance_km:.1f} km from the forecast's final point.")
+    cpa = compute_cpa(forecast, vessel_lat, vessel_lon)
+    risk = risk_score(cpa, uncertainty_cone=cone, vessel_lat=vessel_lat, vessel_lon=vessel_lon)
 
-    cpa_result = compute_cpa(forecast_df, vessel_lat, vessel_lon)
-    risk_result = risk_score(cpa_result, uncertainty_cone=uncertainty_cone, vessel_lat=vessel_lat, vessel_lon=vessel_lon)
-
-    print("\nCPA result:")
-    print(cpa_result)
-    print("\nRisk assessment:")
-    print(risk_result)
-
-    final_lats = [sample_df["lat"].iloc[-1] for sample_df in uncertainty_cone]
-    final_lons = [sample_df["lon"].iloc[-1] for sample_df in uncertainty_cone]
-    print(f"\nUncertainty cone spread at final forecasted timestep:")
-    print(f"  lat: {min(final_lats):.5f} to {max(final_lats):.5f}")
-    print(f"  lon: {min(final_lons):.5f} to {max(final_lons):.5f}")
-    assert max(final_lats) > min(final_lats), "uncertainty cone collapsed to a single point (lat)"
-    assert max(final_lons) > min(final_lons), "uncertainty cone collapsed to a single point (lon)"
-
-    print("\nAll decision_support.py sanity checks passed.")
+    print(f"\nVessel at ({vessel_lat:.2f}, {vessel_lon:.2f})")
+    print(f"CPA: {cpa['cpa_distance_km']:.1f} km at {cpa['cpa_timestamp']:%Y-%m-%d} "
+          f"({cpa['time_to_cpa_hours']:.0f} h out)")
+    print(f"\nRISK: {risk['level'].upper()}")
+    for key, value in risk.items():
+        if key != "level":
+            print(f"  {key}: {value}")
+    assert risk["level"] in {"red", "amber", "green"}, "risk must always be graded"
+    print("\ndecision_support.py checks passed.")

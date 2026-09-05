@@ -1,423 +1,672 @@
 """
 train_model.py
 
-Trains an XGBoost model to predict the physics residual (residual_u,
-residual_v) from the sliding-window features produced by features.py,
-then evaluates it using trajectory-prediction metrics -- Average and
-Final Displacement Error (ADE/FDE) in KILOMETERS -- rather than generic
-regression metrics like MSE on the residuals themselves. MSE on
-velocity residuals doesn't mean much to a hackathon judge; "the hybrid
-model's 24-hour forecast lands 3.1 km closer to the real iceberg than
-physics alone" does.
+Trains the hybrid physics + gradient-boosting residual model on the real
+NIC/ERA5/CMEMS dataset and scores it the way a navigation user would
+care about: displacement error in kilometres over a multi-step forecast,
+not regression error on a velocity residual.
+
+WHAT IS BEING MEASURED
+======================
+evaluate_trajectory() performs an autoregressive rollout. From a real
+position fix it forecasts forward `horizon_steps` weekly segments, each
+step starting from its own previous FORECAST rather than from ground
+truth, so errors compound the way they do in deployment. It reports:
+
+  ADE -- average displacement error over every forecast step
+  FDE -- displacement error at the final step only, the harder number
+
+Three modes share that machinery so the comparison is exactly
+apples-to-apples:
+
+  persistence -- the iceberg keeps its last observed velocity. The
+                 trivial baseline any forecasting system must beat, and
+                 a strong one for a body with as much inertia as a
+                 gigatonne of ice.
+  physics     -- calibrated free drift, no ML.
+  hybrid      -- calibrated free drift plus the learned residual.
+
+HOW IT IS VALIDATED
+===================
+Two splits, because with fifteen icebergs they answer different
+questions and only reporting the flattering one would be misleading:
+
+  by time     -- train on the earlier weeks, test on the later ones.
+                 This is the deployment-realistic question ("can it
+                 forecast next week from what we know now?") but the
+                 test set shares icebergs with the training set, so the
+                 model has seen each berg's personal residual signature.
+
+  leave-one-iceberg-out -- train on fourteen icebergs, forecast the
+                 fifteenth, repeat for all of them. This is the honest
+                 generalisation question ("does it work on a berg it has
+                 never seen?") and it is the headline number.
+
+In BOTH cases the physics coefficients are recalibrated on the training
+fold only. Calibrating once on the full dataset before splitting is a
+subtle leak -- the test period's observations would be helping to set
+the baseline it is then scored against.
 """
 
 from __future__ import annotations
 
+import json
 import os
-import re
+from dataclasses import asdict
+from pathlib import Path
 
 import joblib
 import numpy as np
 import pandas as pd
 import xgboost as xgb
+from sklearn.linear_model import Ridge
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 
-from data_ingest import generate_synthetic_track
-from features import build_sliding_window_features
-from physics import free_drift_velocity, geodesic_distance_km, step_position
+import config
+from features import (
+    LAG_BASE_COLUMNS,
+    TARGET_COLUMNS,
+    build_feature_table,
+    build_single_feature_row,
+    calibrate_drift_params,
+    compute_observed_velocity,
+    compute_physics_residual,
+    feature_column_names,
+)
+from physics import DriftParams, free_drift_velocity, geodesic_distance_km, step_position
 
-MODELS_DIR = "models"
+# Deliberately small-capacity settings. The real pooled dataset is ~130
+# labelled segments with 17 features; the defaults that suited a
+# 120-step synthetic track (200 trees, depth 4) memorise it outright.
+# Depth 2 with heavy subsampling and a large min_child_weight keeps the
+# model to roughly "a few interaction terms on top of the physics".
+XGB_PARAMS: dict[str, object] = {
+    "n_estimators": 300,
+    "max_depth": 2,
+    "learning_rate": 0.03,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8,
+    "min_child_weight": 5,
+    "reg_lambda": 2.0,
+    "random_state": 42,
+    "n_jobs": 2,
+}
+
+
+# =====================================================================
+# Splitting
+# =====================================================================
 
 
 def train_test_split_by_time(
     feature_df: pd.DataFrame, test_fraction: float = 0.2
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Split a feature table chronologically into train/test sets.
+    """Split a feature table chronologically into train and test sets.
 
-    CRITICAL: this splits on TIME ORDER -- training on the earlier
-    portion of the track and testing on the later portion -- rather
-    than a random shuffle split. A random split would let rows from
-    the middle of the track (whose neighbors in time are in the
-    training set) leak information about local drift patterns into
-    training, giving unrealistically good test performance. In a real
-    deployment, the model only ever has to forecast the FUTURE from a
-    model trained on the PAST, so the evaluation must respect that same
-    ordering -- this is one of the most common mistakes reviewers will
-    specifically check for in a trajectory-prediction hackathon
-    project.
+    The split is on a TIMESTAMP CUTOFF, not on row position: the pooled
+    table interleaves fifteen icebergs, so slicing by row index would put
+    the same calendar week on both sides of the split for different
+    bergs. Every row at or after the cutoff date is test, everything
+    before is train.
+
+    A random shuffle split would be badly wrong here. Adjacent segments
+    of one iceberg share environmental forcing and a lag-1 residual, so a
+    shuffled test row would sit between two training rows that all but
+    give away its answer.
 
     Args:
-        feature_df: A feature table as returned by
-            build_sliding_window_features(), sorted ascending by
-            timestamp.
-        test_fraction: Fraction of rows (by time order, not randomly)
-            to hold out for the test set.
+        feature_df: A feature table from features.build_feature_table().
+        test_fraction: Approximate fraction of rows to hold out, taken
+            from the end of the record.
 
     Returns:
-        A (train_df, test_df) tuple, each a contiguous chronological
-        slice of feature_df.
+        A (train_df, test_df) tuple.
+
+    Raises:
+        ValueError: If either side of the split comes out empty.
     """
     df = feature_df.sort_values("timestamp").reset_index(drop=True)
-    split_idx = int(round(len(df) * (1.0 - test_fraction)))
-    train_df = df.iloc[:split_idx].reset_index(drop=True)
-    test_df = df.iloc[split_idx:].reset_index(drop=True)
+    cutoff = df["timestamp"].quantile(1.0 - test_fraction)
+    train_df = df[df["timestamp"] < cutoff].reset_index(drop=True)
+    test_df = df[df["timestamp"] >= cutoff].reset_index(drop=True)
+
+    if train_df.empty or test_df.empty:
+        raise ValueError(
+            f"train_test_split_by_time: test_fraction={test_fraction} produced an empty "
+            f"split ({len(train_df)} train / {len(test_df)} test rows) at cutoff {cutoff}. "
+            f"The record spans {df['timestamp'].min()} to {df['timestamp'].max()}."
+        )
     return train_df, test_df
 
 
+# =====================================================================
+# Training
+# =====================================================================
+
+
 def train_residual_model(
-    train_df: pd.DataFrame, feature_cols: list[str], target_cols: list[str]
+    train_df: pd.DataFrame,
+    feature_cols: list[str],
+    target_cols: list[str] = TARGET_COLUMNS,
+    model_type: str = "xgb",
+    drift_params: DriftParams | None = None,
+    save_dir: str | Path | None = None,
+    forecast_mode: str = "hybrid",
 ) -> dict:
-    """Train one XGBoost regressor per residual target (u and v).
+    """Fit one regressor per residual component and return them as a bundle.
 
-    XGBoost's sklearn API (XGBRegressor) is single-output, so we train
-    two independent regressors rather than one multi-output model.
-    Hyperparameters (n_estimators=200, max_depth=4, learning_rate=0.05)
-    are reasonable hackathon defaults, deliberately not tuned further.
-
-    Both models are saved to disk with joblib
-    (models/residual_u.joblib, models/residual_v.joblib), creating the
-    models/ directory if needed, so decision_support.py (or a fresh
-    process) can load them without retraining. The exact feature_cols
-    list and its order are also saved alongside
-    (models/feature_cols.json) since predict_residual() needs to know
-    which columns, in which order, the models expect -- that ordering
-    isn't recoverable from the .joblib files alone.
+    XGBoost's sklearn API is single-output, so residual_u and residual_v
+    get a model each. `model_type="ridge"` fits a standardised linear
+    model instead -- worth having, not as a toy: with ~130 training rows
+    a linear correction is a serious competitor to a tree ensemble, and
+    if it wins, the honest thing is to ship it.
 
     Args:
-        train_df: Training slice of a feature table (from
-            train_test_split_by_time), containing feature_cols and
-            target_cols.
-        feature_cols: Names of the model input columns.
-        target_cols: Names of the target columns; must include
-            "residual_u" and "residual_v" (order does not matter, they
-            are located by name).
+        train_df: Training rows, containing feature_cols and target_cols.
+        feature_cols: Model input column names, in the order the model
+            will be fitted (and must later be predicted) on.
+        target_cols: Must contain "residual_u" and "residual_v".
+        model_type: "xgb" or "ridge".
+        drift_params: The calibrated physics coefficients this model was
+            trained to correct. Stored in the bundle (and on disk) so a
+            forecast can never be run with a different baseline than the
+            residual was fitted against -- which would silently produce a
+            correction for physics that is not the physics being used.
+        save_dir: Directory to persist the bundle to; None skips saving.
+        forecast_mode: "hybrid" or "physics" -- recorded in the bundle so
+            decision_support.py knows whether the learned residual was
+            actually validated as an improvement (see
+            select_forecast_mode()). The model is saved either way.
 
     Returns:
-        A dict {"u": model_u, "v": model_v, "feature_cols":
-        feature_cols} -- feature_cols is included so predict_residual()
-        can align/reorder incoming feature rows correctly regardless of
-        the column order the caller happens to pass them in.
+        A dict with keys "u", "v" (fitted estimators), "feature_cols",
+        "drift_params" and "model_type".
 
     Raises:
-        ValueError: If target_cols does not contain both "residual_u"
-            and "residual_v".
+        ValueError: If target_cols lacks either residual component, or
+            model_type is unrecognised.
     """
-    if "residual_u" not in target_cols or "residual_v" not in target_cols:
+    missing = [c for c in ("residual_u", "residual_v") if c not in target_cols]
+    if missing:
+        raise ValueError(f"train_residual_model: target_cols must include {missing}.")
+
+    def _new_model():
+        if model_type == "xgb":
+            return xgb.XGBRegressor(**XGB_PARAMS)
+        if model_type == "ridge":
+            # Standardise first: the features mix m/s (~0.05), degrees
+            # (~-65) and hours (~170), so an unscaled ridge penalty would
+            # fall almost entirely on the small-magnitude columns.
+            return make_pipeline(StandardScaler(), Ridge(alpha=1.0))
         raise ValueError(
-            f"train_residual_model: target_cols must include both 'residual_u' and "
-            f"'residual_v', got {target_cols}."
+            f"train_residual_model: unknown model_type={model_type!r}; expected 'xgb' or 'ridge'."
         )
 
-    X_train = train_df[feature_cols]
+    X = train_df[feature_cols]
+    model_u = _new_model().fit(X, train_df["residual_u"])
+    model_v = _new_model().fit(X, train_df["residual_v"])
 
-    xgb_kwargs = dict(n_estimators=200, max_depth=4, learning_rate=0.05, random_state=42)
-    model_u = xgb.XGBRegressor(**xgb_kwargs)
-    model_u.fit(X_train, train_df["residual_u"])
+    bundle = {
+        "u": model_u,
+        "v": model_v,
+        "feature_cols": list(feature_cols),
+        "drift_params": drift_params or DriftParams(),
+        "model_type": model_type,
+        "forecast_mode": forecast_mode,
+    }
 
-    model_v = xgb.XGBRegressor(**xgb_kwargs)
-    model_v.fit(X_train, train_df["residual_v"])
+    if save_dir is not None:
+        save_dir = Path(save_dir)
+        os.makedirs(save_dir, exist_ok=True)
+        joblib.dump(model_u, save_dir / "residual_u.joblib")
+        joblib.dump(model_v, save_dir / "residual_v.joblib")
+        # The feature order and the drift coefficients are not
+        # recoverable from the .joblib files, and a forecast is wrong
+        # without both, so they are written alongside.
+        with open(save_dir / "model_meta.json", "w") as handle:
+            json.dump(
+                {
+                    "feature_cols": list(feature_cols),
+                    "drift_params": asdict(bundle["drift_params"]),
+                    "model_type": model_type,
+                    "forecast_mode": forecast_mode,
+                    "n_train_rows": int(len(train_df)),
+                },
+                handle,
+                indent=2,
+            )
 
-    os.makedirs(MODELS_DIR, exist_ok=True)
-    joblib.dump(model_u, os.path.join(MODELS_DIR, "residual_u.joblib"))
-    joblib.dump(model_v, os.path.join(MODELS_DIR, "residual_v.joblib"))
-    pd.Series(feature_cols).to_json(os.path.join(MODELS_DIR, "feature_cols.json"), orient="values")
+    return bundle
 
-    return {"u": model_u, "v": model_v, "feature_cols": list(feature_cols)}
+
+def load_residual_model(save_dir: str | Path = config.MODELS_DIR) -> dict:
+    """Load a saved model bundle from disk.
+
+    Args:
+        save_dir: Directory previously passed to train_residual_model().
+
+    Returns:
+        A bundle dict in the same shape train_residual_model() returns.
+
+    Raises:
+        FileNotFoundError: If the directory lacks the expected files.
+    """
+    save_dir = Path(save_dir)
+    meta_path = save_dir / "model_meta.json"
+    if not meta_path.exists():
+        raise FileNotFoundError(
+            f"load_residual_model: {meta_path} not found. Train and save a model first "
+            f"(python src/train_on_real_data.py)."
+        )
+    with open(meta_path) as handle:
+        meta = json.load(handle)
+    return {
+        "u": joblib.load(save_dir / "residual_u.joblib"),
+        "v": joblib.load(save_dir / "residual_v.joblib"),
+        "feature_cols": meta["feature_cols"],
+        "drift_params": DriftParams(**meta["drift_params"]),
+        "model_type": meta.get("model_type", "xgb"),
+        "forecast_mode": meta.get("forecast_mode", "hybrid"),
+    }
 
 
 def predict_residual(models: dict, feature_row: pd.Series | pd.DataFrame) -> tuple[float, float]:
-    """Predict (residual_u, residual_v) for one feature row using trained models.
+    """Predict (residual_u, residual_v) for one feature row.
 
-    Accepts EITHER a pd.Series (a single row, e.g. from
-    `df.iloc[i]`) OR a single-row pd.DataFrame (e.g. `df.iloc[[i]]`) --
-    both are common shapes to end up with when calling this repeatedly
-    during decision_support.py's forecast rollout, so both are
-    supported explicitly rather than assuming one or the other.
-
-    Columns are selected and reordered to match models["feature_cols"]
-    before prediction, so the caller does not need to worry about
-    column ordering matching training order exactly.
+    Accepts a Series or a single-row DataFrame -- both shapes come up
+    naturally during rollout. Columns are reordered to the bundle's
+    feature_cols before prediction, so callers need not match training
+    order themselves.
 
     Args:
-        models: The dict returned by train_residual_model(), containing
-            "u", "v" (fitted XGBRegressor instances) and
-            "feature_cols" (the exact column order they expect).
-        feature_row: A single row of features, as a Series or a
-            single-row DataFrame.
+        models: A bundle from train_residual_model() or
+            load_residual_model().
+        feature_row: One row of features.
 
     Returns:
-        A (residual_u, residual_v) tuple of floats for that one row.
-        (If a multi-row DataFrame is passed instead of a single row,
-        this returns a pair of 1D numpy arrays -- one prediction per
-        row -- rather than floats; single-row input is the expected
-        and documented use case.)
+        A (residual_u, residual_v) tuple of floats. For a multi-row
+        DataFrame, a pair of arrays is returned instead.
 
     Raises:
-        KeyError: If feature_row is missing any column in
-            models["feature_cols"].
+        KeyError: If the row is missing any of the bundle's feature_cols.
     """
-    if isinstance(feature_row, pd.Series):
-        frame = feature_row.to_frame().T
-    else:
-        frame = feature_row
-
-    frame = frame[models["feature_cols"]]
+    frame = feature_row.to_frame().T if isinstance(feature_row, pd.Series) else feature_row
+    missing = [c for c in models["feature_cols"] if c not in frame.columns]
+    if missing:
+        raise KeyError(f"predict_residual: feature row is missing {missing}.")
+    frame = frame[models["feature_cols"]].astype(float)
 
     pred_u = models["u"].predict(frame)
     pred_v = models["v"].predict(frame)
-
     if len(frame) == 1:
         return float(pred_u[0]), float(pred_v[0])
     return pred_u, pred_v
 
 
-def _infer_window_size(feature_cols: list[str]) -> int:
-    """Infer the sliding-window size used to build feature_cols from their names.
-
-    Lag feature columns are named "{var}_t-{lag}" (see
-    features.build_sliding_window_features); the window size is the
-    maximum lag number present across all such columns.
-
-    Args:
-        feature_cols: The feature column names to inspect.
-
-    Returns:
-        The inferred window size, or 0 if no lag columns are found.
-    """
-    lag_pattern = re.compile(r"_t-(\d+)$")
-    lags = [int(m.group(1)) for col in feature_cols if (m := lag_pattern.search(col))]
-    return max(lags) if lags else 0
+# =====================================================================
+# Trajectory evaluation
+# =====================================================================
 
 
 def evaluate_trajectory(
-    models: dict | None,
-    test_track_df: pd.DataFrame,
-    feature_cols: list[str],
-    forecast_horizon_steps: int = 4,
+    track_df: pd.DataFrame,
+    mode: str = "physics",
+    models: dict | None = None,
+    drift_params: DriftParams | None = None,
+    n_lags: int = config.DEFAULT_N_LAGS,
+    horizon_steps: int = config.DEFAULT_HORIZON_STEPS,
+    group_col: str | None = "iceberg_id",
+    restrict_to: set[str] | None = None,
 ) -> dict:
-    """Roll forecasts forward step-by-step and score them with ADE/FDE, in kilometers.
+    """Roll forecasts forward step by step and score them in kilometres.
 
-    This is the central evaluation function: rather than scoring
-    single-step residual prediction accuracy (which would flatter any
-    model, since one-step errors don't compound), it actually performs
-    an autoregressive multi-step rollout -- each forecasted position
-    becomes the starting point for the next step's prediction, exactly
-    as it would during real deployment -- and measures how far that
-    rollout ends up from the REAL recorded track.
+    For every valid starting fix of every iceberg, this forecasts
+    `horizon_steps` segments ahead and measures the geodesic distance
+    from each forecast position to the real fix at that time. Crucially
+    the rollout continues from its OWN previous forecast, so error
+    compounds as it does in deployment -- scoring one-step residual
+    accuracy instead would flatter every model.
 
-    For each valid starting index i in test_track_df:
-      - current position := test_track_df's real (lat, lon) at row i.
-      - For each of the next forecast_horizon_steps rows (i+1 .. i+H):
-          - Look up the REAL environmental data (u_wind, v_wind,
-            u_current, v_current) at that future row from
-            test_track_df. This is legitimate for *historical*
-            evaluation -- those values already happened and are in our
-            schema -- as opposed to true future forecasting
-            (decision_support.py's problem), which cannot know future
-            wind/current and must handle that separately.
-          - physics prediction := free_drift_velocity(...) using that
-            real environmental data and the CURRENT (rolled-forward,
-            not ground-truth) latitude, since ground-truth position is
-            exactly what we're trying to forecast.
-          - If models is not None: build a feature row using REAL
-            historical lag values of wind/current/area (already
-            observed, so legitimately known) plus the CURRENT rolled
-            lat/lon and the physics prediction just computed, and add
-            the model's predicted residual to the physics velocity.
-            If models is None, skip this step entirely -- this makes
-            the function double as the PURE PHYSICS baseline evaluator
-            for direct comparison.
-          - Advance position with physics.step_position() using the
-            real elapsed time between the two rows.
-          - Compare the resulting forecasted position to the REAL
-            observed position at that row via geodesic_distance_km(),
-            and record that displacement error.
-          - The rollout continues from the FORECASTED position (not
-            the real one) for the next step, so errors compound
-            realistically across the horizon.
+    Future wind and current are taken from the real record. That is
+    legitimate for a hindcast: it isolates the drift model's error from
+    the weather forecast's error, which is a separate system. True
+    forward forecasting has to live with an imperfect weather forecast,
+    and decision_support.py handles that case with its uncertainty cone.
 
-    ADE (Average Displacement Error) is the mean of every recorded
-    per-step displacement error, across every step of every rollout.
-    FDE (Final Displacement Error) is the mean of only the LAST step's
-    displacement error from each rollout -- typically the harder, more
-    decision-relevant number, since it reflects the fully-compounded
-    error at the end of the forecast horizon.
+    Iceberg AREA is held at its last known value through the rollout
+    rather than read from the future record, since a real forecast would
+    not know it.
+
+    For the hybrid mode, lag features beyond the first step come from the
+    model's OWN predictions -- its previous predicted residual and
+    velocity feed the next step. Reading the real observed values at
+    every step would be leakage: those are exactly the future positions
+    being forecast.
 
     Args:
-        models: The dict from train_residual_model(), or None to
-            evaluate the pure-physics (no ML residual) baseline.
-        test_track_df: A raw track DataFrame (NOT a feature table) --
-            timestamp/lat/lon/area_km2/u_wind/v_wind/u_current/
-            v_current -- covering the evaluation period, sorted
-            ascending by timestamp.
-        feature_cols: The feature column names the models expect (used
-            here only to infer the lag window size needed to build
-            feature rows on the fly during rollout; ignored when
-            models is None but still required so the SAME set of
-            rollout starting points is used in both the baseline and
-            hybrid evaluations, keeping the comparison apples-to-apples).
-        forecast_horizon_steps: Number of steps to forecast ahead in
-            each rollout.
+        track_df: A pooled track table (raw, from
+            data_ingest.build_real_dataset()).
+        mode: "persistence", "physics" or "hybrid".
+        models: The bundle to use; required for mode="hybrid".
+        drift_params: Calibrated drift coefficients. Defaults to the
+            bundle's if models is given, else the config defaults.
+        n_lags: Number of lags the model expects.
+        horizon_steps: Segments to forecast ahead per rollout.
+        group_col: Iceberg grouping column, or None for a single track.
+        restrict_to: If given, only evaluate these iceberg ids (used by
+            the leave-one-out loop to score the held-out berg).
 
     Returns:
-        A dict: {"ade_km": float, "fde_km": float, "n_rollouts": int,
-        "horizon_steps": int}.
+        A dict with ade_km, fde_km, n_rollouts, horizon_steps, mode,
+        per_step_km (mean error at each step) and n_icebergs.
+
+    Raises:
+        ValueError: If mode is unrecognised, or mode="hybrid" without
+            models.
     """
-    df = test_track_df.sort_values("timestamp").reset_index(drop=True)
-    window_size = _infer_window_size(feature_cols)
+    if mode not in {"persistence", "physics", "hybrid"}:
+        raise ValueError(
+            f"evaluate_trajectory: unknown mode={mode!r}; expected 'persistence', "
+            f"'physics' or 'hybrid'."
+        )
+    if mode == "hybrid" and models is None:
+        raise ValueError("evaluate_trajectory: mode='hybrid' requires a trained `models` bundle.")
 
-    lag_base_cols = ["u_wind", "v_wind", "u_current", "v_current", "area_km2"]
+    if drift_params is None:
+        drift_params = models["drift_params"] if models is not None else DriftParams()
 
-    # Valid starting indices: need `window_size` rows of history before
-    # the first forecasted row (i+1), and `forecast_horizon_steps` rows
-    # of real future track to compare against. Using the SAME
-    # window_size-derived lower bound whether or not models is None
-    # keeps the baseline and hybrid evaluations comparable over
-    # identical rollout starting points.
-    i_min = window_size
-    i_max_exclusive = len(df) - forecast_horizon_steps
-    start_indices = range(i_min, i_max_exclusive)
+    enriched = compute_physics_residual(track_df, params=drift_params, group_col=group_col)
+    if group_col is None:
+        enriched = enriched.assign(iceberg_id="track")
+        group_key = "iceberg_id"
+    else:
+        group_key = group_col
 
-    all_step_errors_km: list[float] = []
-    final_step_errors_km: list[float] = []
+    max_segment_hours = config.MAX_SEGMENT_DAYS * 24.0
+    step_errors: list[list[float]] = [[] for _ in range(horizon_steps)]
+    n_rollouts = 0
+    icebergs_used: set[str] = set()
 
-    # Two nested loops here are the "sequential integration" exception
-    # to vectorization: each rollout step's position depends on the
-    # previous step's *forecasted* (not ground-truth) position, so this
-    # cannot be vectorized across steps within a rollout.
-    for i in start_indices:
-        current_lat = df["lat"].iloc[i]
-        current_lon = df["lon"].iloc[i]
+    for iceberg_id, group in enriched.groupby(group_key, sort=True):
+        if restrict_to is not None and iceberg_id not in restrict_to:
+            continue
+        berg = group.sort_values("timestamp").reset_index(drop=True)
+        n = len(berg)
 
-        for step in range(1, forecast_horizon_steps + 1):
-            target_row = i + step
-            prev_row = target_row - 1
+        # A start needs n_lags rows of history behind it (for the lag
+        # features) and horizon_steps real fixes ahead to score against.
+        # The same bound is applied in every mode so all three are
+        # compared over an identical set of rollouts.
+        for start in range(n_lags, n - horizon_steps):
+            steps = berg.iloc[start + 1 : start + 1 + horizon_steps]
+            if (steps["dt_hours"] > max_segment_hours).any():
+                # A multi-week gap in the record: forecasting "one step"
+                # across it is not the same task as the other rollouts.
+                continue
 
-            real_u_wind = df["u_wind"].iloc[target_row]
-            real_v_wind = df["v_wind"].iloc[target_row]
-            real_u_current = df["u_current"].iloc[target_row]
-            real_v_current = df["v_current"].iloc[target_row]
+            current_lat = float(berg["lat"].iloc[start])
+            current_lon = float(berg["lon"].iloc[start])
+            last_known_area = float(berg["area_km2"].iloc[start])
 
-            phys_u, phys_v = free_drift_velocity(
-                u_wind=real_u_wind,
-                v_wind=real_v_wind,
-                u_current=real_u_current,
-                v_current=real_v_current,
-                lat_deg=current_lat,
-            )
+            # Seed the lag history from real observations, most recent
+            # first; predictions are pushed onto the front as we roll.
+            history = [
+                {col: float(berg[col].iloc[start - offset]) for col in LAG_BASE_COLUMNS}
+                for offset in range(n_lags)
+            ]
 
-            if models is not None:
-                feature_values = {"lat": current_lat, "lon": current_lon, "phys_u": phys_u, "phys_v": phys_v}
-                for col in lag_base_cols:
-                    for lag in range(1, window_size + 1):
-                        feature_values[f"{col}_t-{lag}"] = df[col].iloc[target_row - lag]
-                feature_row = pd.Series(feature_values)
-                residual_u, residual_v = predict_residual(models, feature_row)
-                total_u = phys_u + residual_u
-                total_v = phys_v + residual_v
-            else:
-                total_u, total_v = phys_u, phys_v
+            for step in range(1, horizon_steps + 1):
+                target = berg.iloc[start + step]
+                dt_seconds = float(target["dt_hours"]) * 3600.0
 
-            dt_seconds = (
-                df["timestamp"].iloc[target_row] - df["timestamp"].iloc[prev_row]
-            ).total_seconds()
-            forecast_lat, forecast_lon = step_position(
-                lat=current_lat, lon=current_lon, u_ms=total_u, v_ms=total_v, dt_seconds=dt_seconds
-            )
+                if mode == "persistence":
+                    total_u = history[0]["obs_u"]
+                    total_v = history[0]["obs_v"]
+                    residual_u = residual_v = 0.0
+                else:
+                    phys_u, phys_v = free_drift_velocity(
+                        u_wind=float(target["u_wind"]),
+                        v_wind=float(target["v_wind"]),
+                        u_current=float(target["u_current"]),
+                        v_current=float(target["v_current"]),
+                        lat_deg=current_lat,
+                        **drift_params.as_kwargs(),
+                    )
+                    residual_u = residual_v = 0.0
+                    if mode == "hybrid":
+                        state: dict[str, float] = {
+                            "lat": current_lat,
+                            "lon": current_lon,
+                            "area_km2": last_known_area,
+                            "u_wind": float(target["u_wind"]),
+                            "v_wind": float(target["v_wind"]),
+                            "u_current": float(target["u_current"]),
+                            "v_current": float(target["v_current"]),
+                            "phys_u": phys_u,
+                            "phys_v": phys_v,
+                            "dt_hours": float(target["dt_hours"]),
+                        }
+                        for lag, past in enumerate(history, start=1):
+                            for col in LAG_BASE_COLUMNS:
+                                state[f"{col}_t-{lag}"] = past[col]
+                        row = build_single_feature_row(state, n_lags=n_lags)
+                        residual_u, residual_v = predict_residual(models, row)
+                    total_u = phys_u + residual_u
+                    total_v = phys_v + residual_v
 
-            actual_lat = df["lat"].iloc[target_row]
-            actual_lon = df["lon"].iloc[target_row]
-            error_km = geodesic_distance_km(forecast_lat, forecast_lon, actual_lat, actual_lon)
+                forecast_lat, forecast_lon = step_position(
+                    current_lat, current_lon, total_u, total_v, dt_seconds
+                )
+                step_errors[step - 1].append(
+                    geodesic_distance_km(
+                        forecast_lat, forecast_lon, float(target["lat"]), float(target["lon"])
+                    )
+                )
 
-            all_step_errors_km.append(error_km)
-            if step == forecast_horizon_steps:
-                final_step_errors_km.append(error_km)
+                # Autoregressive feedback: the next step's lag features
+                # are this step's PREDICTIONS, not the truth we are
+                # trying to forecast.
+                history.insert(
+                    0,
+                    {
+                        "obs_u": total_u,
+                        "obs_v": total_v,
+                        "residual_u": residual_u,
+                        "residual_v": residual_v,
+                    },
+                )
+                history = history[:n_lags]
+                current_lat, current_lon = forecast_lat, forecast_lon
 
-            # Roll forward using our OWN forecast, not the ground truth
-            # -- this is what makes the evaluation an honest multi-step
-            # rollout instead of a series of independent one-step
-            # predictions.
-            current_lat, current_lon = forecast_lat, forecast_lon
+            n_rollouts += 1
+            icebergs_used.add(str(iceberg_id))
 
-    n_rollouts = len(start_indices)
-    ade_km = float(np.mean(all_step_errors_km)) if all_step_errors_km else float("nan")
-    fde_km = float(np.mean(final_step_errors_km)) if final_step_errors_km else float("nan")
-
+    flat = [e for step in step_errors for e in step]
     return {
-        "ade_km": ade_km,
-        "fde_km": fde_km,
+        "mode": mode,
+        "ade_km": float(np.mean(flat)) if flat else float("nan"),
+        "fde_km": float(np.mean(step_errors[-1])) if step_errors[-1] else float("nan"),
+        "per_step_km": [float(np.mean(s)) if s else float("nan") for s in step_errors],
         "n_rollouts": n_rollouts,
-        "horizon_steps": forecast_horizon_steps,
+        "n_icebergs": len(icebergs_used),
+        "horizon_steps": horizon_steps,
     }
 
 
-def main() -> tuple[dict, dict]:
-    """Run the full pipeline: generate data, train the hybrid model, and compare against physics-only.
+def leave_one_iceberg_out(
+    pooled_df: pd.DataFrame,
+    n_lags: int = config.DEFAULT_N_LAGS,
+    horizon_steps: int = config.DEFAULT_HORIZON_STEPS,
+    model_type: str = "xgb",
+    verbose: bool = True,
+) -> tuple[pd.DataFrame, dict[str, dict]]:
+    """Score generalisation to an unseen iceberg, one held-out berg at a time.
 
-    Generates a synthetic track with enough steps for a meaningful
-    train/test split, builds sliding-window features, splits
-    chronologically, trains the hybrid residual model, and evaluates
-    BOTH the pure-physics baseline (models=None) and the trained hybrid
-    model on the exact same held-out test period -- printing both
-    ADE/FDE side by side. This baseline-vs-hybrid comparison is the
-    core hackathon result: it should make the value of the ML residual
-    correction immediately visible.
+    For each iceberg: recalibrate the physics on the other fourteen,
+    train the residual model on the other fourteen, then roll forecasts
+    on the held-out one. Nothing about the held-out berg touches either
+    the calibration or the fit, so this answers the question that
+    actually matters operationally -- a newly calved berg has no history
+    for the model to have memorised.
+
+    Args:
+        pooled_df: The pooled real track table.
+        n_lags: Lags per feature row.
+        horizon_steps: Rollout horizon.
+        model_type: "xgb" or "ridge".
+        verbose: Print a line per held-out iceberg.
 
     Returns:
-        A (baseline_metrics, hybrid_metrics) tuple, each a dict as
-        returned by evaluate_trajectory(), for programmatic use (e.g.
-        the sanity-check assertion in this file's __main__ block).
+        A (per_iceberg_df, aggregate) tuple. per_iceberg_df has one row
+        per held-out berg with its ADE/FDE in all three modes; aggregate
+        maps each mode to rollout-weighted overall ADE/FDE.
     """
-    track = generate_synthetic_track(n_steps=400, dt_hours=6, seed=42)
-    feature_df, feature_cols, target_cols = build_sliding_window_features(track, window_size=5)
-    train_df, test_df = train_test_split_by_time(feature_df, test_fraction=0.2)
+    iceberg_ids = sorted(pooled_df["iceberg_id"].unique())
+    rows: list[dict[str, object]] = []
 
-    # Anchor the raw track slice used for trajectory evaluation to the
-    # EXACT same timestamp where the feature-based test split begins,
-    # so there is zero overlap between what the model was trained on
-    # and what it's evaluated against.
-    cutoff_time = test_df["timestamp"].iloc[0]
-    test_track_df = track[track["timestamp"] >= cutoff_time].reset_index(drop=True)
+    for held_out in iceberg_ids:
+        train_track = pooled_df[pooled_df["iceberg_id"] != held_out]
+        test_track = pooled_df[pooled_df["iceberg_id"] == held_out]
 
-    models = train_residual_model(train_df, feature_cols, target_cols)
+        # Calibrate and fit on the training bergs ONLY.
+        train_velocity = compute_observed_velocity(train_track)
+        params = calibrate_drift_params(train_velocity)
+        train_features, feature_cols, target_cols = build_feature_table(
+            train_track, n_lags=n_lags, params=params
+        )
+        if len(train_features) < 20:
+            continue
+        models = train_residual_model(
+            train_features, feature_cols, target_cols, model_type=model_type, drift_params=params
+        )
 
-    forecast_horizon_steps = 4
-    baseline_metrics = evaluate_trajectory(
-        None, test_track_df, feature_cols, forecast_horizon_steps=forecast_horizon_steps
+        result: dict[str, dict] = {}
+        for mode in ("persistence", "physics", "hybrid"):
+            result[mode] = evaluate_trajectory(
+                test_track,
+                mode=mode,
+                models=models if mode == "hybrid" else None,
+                drift_params=params,
+                n_lags=n_lags,
+                horizon_steps=horizon_steps,
+            )
+
+        if result["physics"]["n_rollouts"] == 0:
+            continue
+
+        rows.append(
+            {
+                "iceberg_id": held_out,
+                "n_rollouts": result["physics"]["n_rollouts"],
+                **{f"{mode}_ade_km": result[mode]["ade_km"] for mode in result},
+                **{f"{mode}_fde_km": result[mode]["fde_km"] for mode in result},
+            }
+        )
+        if verbose:
+            print(
+                f"  {held_out:<6} n={result['physics']['n_rollouts']:>2}  "
+                f"ADE km  persist {result['persistence']['ade_km']:7.2f} | "
+                f"physics {result['physics']['ade_km']:7.2f} | "
+                f"hybrid {result['hybrid']['ade_km']:7.2f}"
+            )
+
+    per_iceberg = pd.DataFrame(rows)
+    if per_iceberg.empty:
+        return per_iceberg, {}
+
+    # Weight by rollout count so a berg contributing eight forecasts
+    # counts eight times as much as one contributing a single forecast.
+    weights = per_iceberg["n_rollouts"].to_numpy(dtype=float)
+    aggregate = {
+        mode: {
+            "ade_km": float(np.average(per_iceberg[f"{mode}_ade_km"], weights=weights)),
+            "fde_km": float(np.average(per_iceberg[f"{mode}_fde_km"], weights=weights)),
+            "n_rollouts": int(weights.sum()),
+        }
+        for mode in ("persistence", "physics", "hybrid")
+    }
+    return per_iceberg, aggregate
+
+
+def select_forecast_mode(
+    aggregate: dict[str, dict], min_improvement_pct: float = 5.0
+) -> tuple[str, str]:
+    """Decide whether the learned residual has earned its place in the forecast.
+
+    The hybrid model is not shipped just because it was trained. It is
+    shipped only if it beats the calibrated physics baseline on the
+    leave-one-iceberg-out evaluation by a margin larger than the noise
+    of a ~15-fold, ~130-row experiment. Anything smaller than a few
+    percent on this much data is not a real improvement, and a forecast
+    system that adds an unjustified learned correction is strictly worse
+    than one that does not: same accuracy, more ways to fail, and no
+    physical interpretation when it goes wrong.
+
+    Args:
+        aggregate: The aggregate dict from leave_one_iceberg_out().
+        min_improvement_pct: How much better than physics the hybrid must
+            be, in percent of physics ADE, to be selected.
+
+    Returns:
+        A (mode, rationale) tuple where mode is "hybrid" or "physics".
+    """
+    if not aggregate or "hybrid" not in aggregate or "physics" not in aggregate:
+        return "physics", "No leave-one-out result available; defaulting to physics only."
+
+    physics_ade = aggregate["physics"]["ade_km"]
+    hybrid_ade = aggregate["hybrid"]["ade_km"]
+    improvement = 100.0 * (physics_ade - hybrid_ade) / physics_ade
+
+    if improvement >= min_improvement_pct:
+        return "hybrid", (
+            f"The learned residual improves held-out ADE by {improvement:.1f}% "
+            f"({physics_ade:.1f} -> {hybrid_ade:.1f} km), above the {min_improvement_pct:.0f}% "
+            f"bar; the hybrid is used for forecasting."
+        )
+    return "physics", (
+        f"The learned residual changes held-out ADE by only {-improvement:+.1f}% "
+        f"({physics_ade:.1f} -> {hybrid_ade:.1f} km), below the {min_improvement_pct:.0f}% "
+        f"bar for this dataset size. Forecasts use calibrated physics alone; the trained "
+        f"model is still saved so the comparison can be re-run as the record grows."
     )
-    hybrid_metrics = evaluate_trajectory(
-        models, test_track_df, feature_cols, forecast_horizon_steps=forecast_horizon_steps
+
+
+def feature_importance(models: dict, top_n: int = 12) -> pd.DataFrame:
+    """Summarise which features each residual model actually leaned on.
+
+    Args:
+        models: A bundle from train_residual_model().
+        top_n: Number of features to return.
+
+    Returns:
+        A DataFrame with feature, importance_u, importance_v, sorted by
+        their sum descending. Empty if the estimator exposes no
+        importances (e.g. a ridge pipeline, whose coefficients are on
+        standardised inputs and are reported instead).
+    """
+    def _scores(model) -> np.ndarray | None:
+        if hasattr(model, "feature_importances_"):
+            return np.asarray(model.feature_importances_, dtype=float)
+        if hasattr(model, "named_steps") and "ridge" in getattr(model, "named_steps", {}):
+            return np.abs(np.asarray(model.named_steps["ridge"].coef_, dtype=float))
+        return None
+
+    scores_u, scores_v = _scores(models["u"]), _scores(models["v"])
+    if scores_u is None or scores_v is None:
+        return pd.DataFrame(columns=["feature", "importance_u", "importance_v"])
+
+    frame = pd.DataFrame(
+        {"feature": models["feature_cols"], "importance_u": scores_u, "importance_v": scores_v}
     )
-
-    horizon_hours = forecast_horizon_steps * 6  # dt_hours=6 in generate_synthetic_track above
-    print("=" * 60)
-    print(f"TRAJECTORY FORECAST EVALUATION -- {forecast_horizon_steps}-step "
-          f"(~{horizon_hours}h) rollout, {baseline_metrics['n_rollouts']} rollouts")
-    print("=" * 60)
-    print(f"{'Metric':<12}{'Physics-only':>16}{'Hybrid (Physics+ML)':>24}")
-    print(f"{'ADE (km)':<12}{baseline_metrics['ade_km']:>16.3f}{hybrid_metrics['ade_km']:>24.3f}")
-    print(f"{'FDE (km)':<12}{baseline_metrics['fde_km']:>16.3f}{hybrid_metrics['fde_km']:>24.3f}")
-    ade_improvement_pct = 100.0 * (1.0 - hybrid_metrics["ade_km"] / baseline_metrics["ade_km"])
-    fde_improvement_pct = 100.0 * (1.0 - hybrid_metrics["fde_km"] / baseline_metrics["fde_km"])
-    print("-" * 60)
-    print(f"ADE improvement: {ade_improvement_pct:+.1f}%   FDE improvement: {fde_improvement_pct:+.1f}%")
-    print("=" * 60)
-
-    return baseline_metrics, hybrid_metrics
+    return frame.assign(total=frame["importance_u"] + frame["importance_v"]) \
+                .sort_values("total", ascending=False) \
+                .drop(columns="total") \
+                .head(top_n) \
+                .reset_index(drop=True)
 
 
 if __name__ == "__main__":
-    baseline_metrics, hybrid_metrics = main()
+    from train_on_real_data import main
 
-    # Sanity floor: if the hybrid model is dramatically worse than pure
-    # physics, something is almost certainly broken (e.g. train/test
-    # leakage inflating training performance while generalizing badly,
-    # or a units mismatch between m/s and km/h somewhere in the
-    # pipeline) -- catch that here rather than only noticing it later
-    # in decision_support.py.
-    assert hybrid_metrics["ade_km"] <= 1.5 * baseline_metrics["ade_km"], (
-        f"Hybrid model's ADE ({hybrid_metrics['ade_km']:.3f} km) is more than 1.5x worse than "
-        f"the physics-only baseline's ADE ({baseline_metrics['ade_km']:.3f} km). This suggests a "
-        f"bug (train/test leakage, a units mismatch, or a broken feature) rather than a "
-        f"genuinely weak model -- investigate before trusting these results."
-    )
-    print("\nSanity check passed: hybrid model is not dramatically worse than physics-only baseline.")
+    main()

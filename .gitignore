@@ -1,0 +1,14 @@
+# Credentials -- .cdsapirc holds a live CDS API key
+.cdsapirc
+.copernicusmarine*
+
+# Downloaded environmental data (~240 MB, rebuilt from the APIs on demand)
+data/cache/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# macOS
+.DS_Store

@@ -1,0 +1,24 @@
+# Core
+numpy>=2.0
+pandas>=2.2
+scipy>=1.11
+pyproj>=3.6
+
+# Modelling
+scikit-learn>=1.4
+xgboost>=2.0
+joblib>=1.3
+
+# Gridded environmental data
+xarray>=2024.1
+netCDF4>=1.6
+dask>=2024.1
+
+# Data sources
+cdsapi>=0.7          # ERA5 wind  -- needs ~/.cdsapirc
+copernicusmarine>=2.0  # CMEMS currents -- needs `copernicusmarine login`
+
+# Dashboard
+dash>=3.0
+dash-bootstrap-components>=2.0
+plotly>=6.0

@@ -1,0 +1,29 @@
+{
+  "feature_cols": [
+    "phys_u",
+    "phys_v",
+    "u_wind",
+    "v_wind",
+    "u_current",
+    "v_current",
+    "wind_speed",
+    "current_speed",
+    "lat",
+    "lon_sin",
+    "lon_cos",
+    "log_area",
+    "dt_hours",
+    "obs_u_t-1",
+    "obs_v_t-1",
+    "residual_u_t-1",
+    "residual_v_t-1"
+  ],
+  "drift_params": {
+    "wind_factor": 0.0,
+    "deflection_deg": 0.0,
+    "current_factor": 0.6629197431470286
+  },
+  "model_type": "xgb",
+  "forecast_mode": "physics",
+  "n_train_rows": 129
+}
