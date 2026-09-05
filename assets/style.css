@@ -200,12 +200,37 @@ html, body {
   padding: 0 24px;
 }
 
-.iw-map-only-toggle {
-  font-size: 12.5px;
-  color: var(--ink-soft);
+/* ---------------- Full-screen toggle button ---------------- */
+
+/* Lives inside .iw-map-wrap, so it travels with the map itself and
+   stays reachable whether the panel is at normal size or already
+   expanded to full screen -- no need to hunt for it in a header that
+   might be scrolled out of view. */
+
+.iw-fullscreen-btn {
+  position: absolute;
+  top: 20px;
+  right: 20px;
+  z-index: 5;
+  width: 34px;
+  height: 34px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: rgba(255,255,255,0.92);
+  color: var(--ink);
+  font-size: 16px;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.12);
 }
 
-.iw-map-only-toggle label { display: flex; align-items: center; gap: 4px; }
+.iw-fullscreen-btn:hover {
+  background: #FFFFFF;
+  border-color: var(--ink);
+}
 
 /* ---------------- Map-only popout ---------------- */
 
@@ -260,7 +285,7 @@ html, body {
   color: var(--ink);
 }
 
-.iw-map-wrap { padding: 10px 10px 0 10px; height: 340px; }
+.iw-map-wrap { position: relative; padding: 10px 10px 0 10px; height: 340px; }
 
 .iw-controls {
   padding: 14px 18px;
