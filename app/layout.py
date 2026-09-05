@@ -12,15 +12,16 @@ def _live_panel() -> html.Div:
                 html.Span(className="iw-dot pulse"),
                 html.Span("LIVE FORECAST"),
             ]),
-            dcc.Checklist(
-                id="map-only-toggle",
-                options=[{"label": " Map only", "value": "map_only"}],
-                value=[],
-                className="iw-map-only-toggle",
-            ),
         ]),
 
         html.Div(className="iw-map-wrap", children=[
+            html.Button(
+                "⛶",
+                id="fullscreen-btn",
+                className="iw-fullscreen-btn",
+                title="Toggle full screen",
+                n_clicks=0,
+            ),
             dcc.Loading(
                 dcc.Graph(id="map-graph", config={"displayModeBar": False, "responsive": True},
                           style={"height": "100%"}),
@@ -93,4 +94,5 @@ def build_layout() -> html.Div:
             ]),
         ]),
         dcc.Store(id="forecast-store"),
+        dcc.Store(id="fullscreen-state", data=False),
     ])
