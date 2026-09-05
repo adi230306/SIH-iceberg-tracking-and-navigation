@@ -22,8 +22,8 @@ import re
 import numpy as np
 import pandas as pd
 
-from physics import free_drift_velocity, geodesic_distance_km, step_position
-from train_model import predict_residual
+from src.physics import free_drift_velocity, geodesic_distance_km, step_position
+from src.train_model import predict_residual
 
 # The environmental variables that get lagged into sliding-window
 # features (must match features.LAG_BASE_COLUMNS exactly, since the
