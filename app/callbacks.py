@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-from dash import Dash, Input, Output, html
+from dash import Dash, Input, Output, State, html
 
 import src.decision_support as decision_support
 from src.physics import free_drift_velocity, geodesic_distance_km, step_position
@@ -122,9 +122,9 @@ def register_callbacks(app: Dash, model: dict, metrics: dict) -> None:
         Input("timestep-slider", "value"),
         Input("vessel-lat", "value"),
         Input("vessel-lon", "value"),
-        Input("map-only-toggle", "value"),
+        Input("fullscreen-state", "data"),
     )
-    def render_map_and_list(forecast_data, iceberg_id: str, step: int, vessel_lat, vessel_lon, map_only_value):
+    def render_map_and_list(forecast_data, iceberg_id: str, step: int, vessel_lat, vessel_lon, is_fullscreen):
         track = _load_track(iceberg_id)
         full_forecast = pd.DataFrame(forecast_data) if forecast_data else pd.DataFrame(columns=["timestamp", "lat", "lon"])
 
@@ -136,8 +136,7 @@ def register_callbacks(app: Dash, model: dict, metrics: dict) -> None:
         else:
             visible_forecast = full_forecast
 
-        is_map_only = bool(map_only_value and "map_only" in map_only_value)
-        fig = build_map_figure(track, visible_forecast, expanded=is_map_only)
+        fig = build_map_figure(track, visible_forecast, expanded=bool(is_fullscreen))
         return fig, rows
 
     @app.callback(
@@ -169,12 +168,30 @@ def register_callbacks(app: Dash, model: dict, metrics: dict) -> None:
         return build_diagnostics_figure(metrics)
 
     @app.callback(
+        Output("fullscreen-state", "data"),
+        Input("fullscreen-btn", "n_clicks"),
+        State("fullscreen-state", "data"),
+        prevent_initial_call=True,
+    )
+    def toggle_fullscreen_state(_n_clicks, is_fullscreen):
+        # Clicking the button (which lives on the map itself, so it's
+        # reachable whether the panel is currently normal-sized or
+        # already full screen) just flips the stored boolean; every
+        # other piece of full-screen-dependent UI reacts to that store
+        # rather than to the click event directly.
+        return not is_fullscreen
+
+    @app.callback(
         Output("iw-details", "style"),
         Output("live-panel", "className"),
-        Input("map-only-toggle", "value"),
+        Output("fullscreen-btn", "children"),
+        Output("fullscreen-btn", "title"),
+        Input("fullscreen-state", "data"),
     )
-    def toggle_map_only(toggle_value):
-        is_map_only = bool(toggle_value and "map_only" in toggle_value)
-        details_style = {"display": "none"} if is_map_only else {"display": "block"}
-        panel_class = "iw-panel iw-panel-fullscreen" if is_map_only else "iw-panel"
-        return details_style, panel_class
+    def apply_fullscreen_state(is_fullscreen):
+        is_fullscreen = bool(is_fullscreen)
+        details_style = {"display": "none"} if is_fullscreen else {"display": "block"}
+        panel_class = "iw-panel iw-panel-fullscreen" if is_fullscreen else "iw-panel"
+        icon = "✕" if is_fullscreen else "⛶"
+        title = "Exit full screen" if is_fullscreen else "Full screen"
+        return details_style, panel_class, icon, title
