@@ -43,9 +43,58 @@ ERA5_CACHE_DIR: Path = CACHE_DIR / "era5"
 CURRENTS_CACHE_DIR: Path = CACHE_DIR / "currents"
 MODELS_DIR: Path = REPO_ROOT / "models"
 
-# Glob matching the USNIC/BYU Antarctic iceberg snapshot exports, e.g.
-# data/AntarcticIcebergs_20260904.csv
+# Glob matching the USNIC Antarctic iceberg snapshot exports, e.g.
+# data/AntarcticIcebergs_20260904.csv -- one row per iceberg per date.
 USNIC_CSV_GLOB: str = "AntarcticIcebergs_*.csv"
+
+# The BYU/NIC consolidated Antarctic iceberg database: one CSV per named
+# iceberg, DAILY positions from scatterometer tracking, 1976-present,
+# plus the iceberg's length and width in km. This is the primary
+# training source -- it gives ~20x more segments than the weekly USNIC
+# snapshots, at daily rather than weekly resolution.
+BYU_DIR_NAME: str = "byu"
+BYU_CSV_GLOB: str = "*.csv"
+
+# Training window for the BYU record. The database is decades long, but
+# each month of it needs a month of ERA5 and of ocean-current forcing
+# downloaded to be usable, so the window is a deliberate trade between
+# dataset size and download budget. Widen it and re-run to train on more.
+BYU_START_DATE: str = "2026-01-01"
+BYU_END_DATE: str = "2026-04-30"
+# Icebergs with fewer daily fixes than this in the window are skipped.
+BYU_MIN_FIXES: int = 20
+
+# The BYU fixes are satellite-derived and carry a position error of the
+# same order as an iceberg's DAILY displacement (a berg drifting at
+# 0.04 m/s moves ~3.5 km/day). Differencing consecutive daily fixes
+# therefore measures mostly noise: the raw daily speed distribution has a
+# median of 0.037 m/s but an RMS of 0.28 m/s, and the residual's lag-1
+# autocorrelation comes out NEGATIVE (-0.31), which is the signature of
+# independent per-fix error rather than of real motion.
+#
+# Binning positions into multi-day windows and taking the MEDIAN
+# position per bin fixes both problems at once: it averages the noise
+# down and it is robust to the occasional grossly wrong fix. 2 days is
+# the shortest bin at which the physics fit stops degrading.
+BYU_RESAMPLE_DAYS: int = 2
+
+# Segments implying a speed above this are discarded as bad fixes rather
+# than modelled. No Antarctic iceberg sustains 0.5 m/s (43 km/day); the
+# fastest in this record averages ~0.27 m/s over months.
+MAX_PLAUSIBLE_SPEED_MS: float = 0.5
+
+# Minimum "straightness" -- net displacement divided by total path
+# length -- for an iceberg to count as genuinely drifting.
+#
+# This exists because the mean-speed test alone CANNOT identify a
+# grounded iceberg in noisy daily data: position error inflates apparent
+# path length without moving the berg anywhere, so a grounded berg
+# reports a healthy mean speed. Iceberg C33 in this record walks 410 km
+# of path and ends 6 km from where it started -- straightness 0.01. A
+# genuinely drifting berg exceeds 0.3. Including these bergs roughly
+# halves the fraction of drift the physics can explain, because there is
+# no physics that predicts jitter.
+MIN_STRAIGHTNESS: float = 0.15
 
 
 def ensure_dirs() -> None:
@@ -82,10 +131,12 @@ DEFAULT_CURRENT_FACTOR: float = 1.0
 SEGMENT_SAMPLE_HOURS: int = 6
 
 # A segment longer than this is dropped from training: a single mean
-# velocity over more than ~three weeks is a very weak label (the iceberg
-# may have looped, stalled, or grounded and released within it), and the
-# free-drift baseline is not meaningful at that timescale.
-MAX_SEGMENT_DAYS: float = 21.0
+# velocity across a long gap is a very weak label (the iceberg may have
+# looped, stalled, or grounded and released within it), and the
+# free-drift baseline is not meaningful at that timescale. The BYU
+# record is daily, so most segments are 1 day and this only trims the
+# gaps where tracking was lost for a while.
+MAX_SEGMENT_DAYS: float = 6.0  # must exceed BYU_RESAMPLE_DAYS by a margin
 
 # Icebergs whose mean speed over the whole record is below this are
 # treated as GROUNDED (or simply not re-observed -- several NIC entries
@@ -104,7 +155,7 @@ CURRENT_BBOX_PAD_DEG: float = 2.0
 # ERA5 is fetched once as a circumpolar band rather than per iceberg:
 # one queued CDS request instead of thirty-odd. 0.5 deg is ample for
 # synoptic Southern Ocean wind driving a ~2% drift term.
-ERA5_LAT_BAND: tuple[float, float] = (-50.0, -77.0)  # (north, south)
+ERA5_LAT_BAND: tuple[float, float] = (-45.0, -78.0)  # (north, south)
 ERA5_GRID_DEG: float = 0.5
 
 # Copernicus Marine analysis/forecast surface currents, 1/12 deg daily.
@@ -113,10 +164,12 @@ COPERNICUS_DATASET_ID: str = "cmems_mod_glo_phy-cur_anfc_0.083deg_P1D-m"
 
 # --- Feature/model defaults ------------------------------------------
 # Number of previous segments of history folded into each feature row.
-# The real record is only 12 snapshots per iceberg, so every extra lag
-# costs a training row per iceberg -- 1 is the default, 2 is usable.
-DEFAULT_N_LAGS: int = 1
+# With the daily BYU record there are thousands of rows, so lags are
+# cheap and 3 days of history is genuinely informative; the weekly USNIC
+# record only supported 1.
+DEFAULT_N_LAGS: int = 3
 
-# Multi-step rollout horizon used for ADE/FDE. With ~weekly snapshots,
-# 3 steps is roughly a three-week forecast.
-DEFAULT_HORIZON_STEPS: int = 3
+# Multi-step rollout horizon used for ADE/FDE. With the daily BYU
+# record a step is one day, so this is a 7-day forecast -- the horizon
+# that actually matters for routing a vessel.
+DEFAULT_HORIZON_STEPS: int = 7

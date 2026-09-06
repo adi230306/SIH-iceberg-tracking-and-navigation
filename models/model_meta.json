@@ -14,16 +14,24 @@
     "log_area",
     "dt_hours",
     "obs_u_t-1",
+    "obs_u_t-2",
+    "obs_u_t-3",
     "obs_v_t-1",
+    "obs_v_t-2",
+    "obs_v_t-3",
     "residual_u_t-1",
-    "residual_v_t-1"
+    "residual_u_t-2",
+    "residual_u_t-3",
+    "residual_v_t-1",
+    "residual_v_t-2",
+    "residual_v_t-3"
   ],
   "drift_params": {
-    "wind_factor": 0.0,
+    "wind_factor": 0.0011923950023779678,
     "deflection_deg": 0.0,
-    "current_factor": 0.6629197431470286
+    "current_factor": 0.2942632652290458
   },
   "model_type": "xgb",
   "forecast_mode": "physics",
-  "n_train_rows": 129
+  "n_train_rows": 639
 }

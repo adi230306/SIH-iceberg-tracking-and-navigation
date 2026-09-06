@@ -5,23 +5,30 @@ from __future__ import annotations
 from dash import dcc, html
 
 
+def _map_toolbar() -> html.Div:
+    """Icon buttons floating over the top-right corner of the map itself
+    (not the panel header), so they travel with the map whether it's at
+    normal size or already popped out to fullscreen."""
+    return html.Div(className="iw-map-toolbar", children=[
+        html.Button("\u2338", id="heatmap-btn", n_clicks=0,
+                    className="iw-map-tool-btn", title="Toggle probability heatmap"),
+        html.Button("\u26f6", id="fullscreen-btn", n_clicks=0,
+                    className="iw-map-tool-btn", title="Toggle fullscreen"),
+    ])
+
+
 def _live_panel() -> html.Div:
     return html.Div(className="iw-panel", id="live-panel", children=[
         html.Div(className="iw-panel-head", children=[
             html.Div(className="iw-panel-head-left", children=[
                 html.Span(className="iw-dot pulse"),
-                html.Span("LIVE FORECAST"),
+                html.Span(id="panel-title", children="LIVE FORECAST"),
             ]),
         ]),
 
         html.Div(className="iw-map-wrap", children=[
-            html.Button(
-                "⛶",
-                id="fullscreen-btn",
-                className="iw-fullscreen-btn",
-                title="Toggle full screen",
-                n_clicks=0,
-            ),
+            _map_toolbar(),
+            html.Div(id="heatmap-meta", className="iw-heatmap-meta", style={"display": "none"}),
             dcc.Loading(
                 dcc.Graph(id="map-graph", config={"displayModeBar": False, "responsive": True},
                           style={"height": "100%"}),
@@ -95,4 +102,5 @@ def build_layout() -> html.Div:
         ]),
         dcc.Store(id="forecast-store"),
         dcc.Store(id="fullscreen-state", data=False),
+        dcc.Store(id="heatmap-state", data=False),
     ])

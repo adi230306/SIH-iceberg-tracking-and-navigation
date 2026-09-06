@@ -95,6 +95,13 @@ TRACK_SCHEMA_COLUMNS: list[str] = [
 # across a group boundary.
 POOLED_SCHEMA_COLUMNS: list[str] = ["iceberg_id"] + TRACK_SCHEMA_COLUMNS + ["segment_hours"]
 
+# The BYU database additionally reports each iceberg's dimensions and
+# which satellite sensor produced each fix. These are carried alongside
+# the core schema (never required by it) so the dashboard can show real
+# iceberg metadata and downstream code that only knows the 8-column
+# contract keeps working unchanged.
+BYU_EXTRA_COLUMNS: list[str] = ["length_km", "width_km", "sensor"]
+
 _GEOD = Geod(ellps="WGS84")
 
 
@@ -349,6 +356,7 @@ def build_iceberg_tracks(
 def summarize_iceberg_motion(
     tracks: dict[str, pd.DataFrame],
     grounded_speed_threshold_ms: float = config.GROUNDED_SPEED_THRESHOLD_MS,
+    min_straightness: float = config.MIN_STRAIGHTNESS,
 ) -> pd.DataFrame:
     """Classify each iceberg as drifting or grounded from its own displacement.
 
@@ -369,11 +377,13 @@ def summarize_iceberg_motion(
         tracks: Mapping of iceberg_id -> track DataFrame, from
             build_iceberg_tracks().
         grounded_speed_threshold_ms: Mean-speed cutoff, m/s.
+        min_straightness: Minimum net-displacement / path-length ratio
+            for a track to count as drifting.
 
     Returns:
-        A DataFrame indexed by row with columns iceberg_id, n_obs,
-        first_seen, last_seen, total_km, mean_speed_ms, max_speed_ms,
-        mean_area_km2, is_grounded -- sorted by total_km descending.
+        A DataFrame with iceberg_id, n_obs, first_seen, last_seen,
+        total_km, net_km, straightness, mean_speed_ms, max_speed_ms,
+        mean_area_km2 and is_grounded -- sorted by total_km descending.
     """
     rows: list[dict[str, object]] = []
     for iceberg_id, track in tracks.items():
@@ -387,6 +397,9 @@ def summarize_iceberg_motion(
 
         total_m = float(dist_m.sum())
         elapsed_s = float(dt_s.sum())
+        # Net displacement start-to-end, against total path walked. A
+        # drifting berg goes somewhere; a grounded berg jitters in place.
+        _fwd, _back, net_m = _GEOD.inv(lons[0], lats[0], lons[-1], lats[-1])
         rows.append(
             {
                 "iceberg_id": iceberg_id,
@@ -399,13 +412,264 @@ def summarize_iceberg_motion(
                 # own duration, which is what we want with uneven gaps.
                 "mean_speed_ms": total_m / elapsed_s if elapsed_s > 0 else 0.0,
                 "max_speed_ms": float(speeds.max()) if speeds.size else 0.0,
+                "net_km": float(net_m) / 1000.0,
+                "straightness": float(net_m / total_m) if total_m > 0 else 0.0,
                 "mean_area_km2": float(track["area_km2"].mean()),
             }
         )
 
     summary = pd.DataFrame(rows)
-    summary["is_grounded"] = summary["mean_speed_ms"] < grounded_speed_threshold_ms
+    # Two independent tests, because neither alone is sufficient:
+    #   - mean speed catches a berg that genuinely does not move;
+    #   - straightness catches a grounded berg whose apparent motion is
+    #     entirely position noise, which the speed test scores as fast.
+    summary["is_grounded"] = (
+        (summary["mean_speed_ms"] < grounded_speed_threshold_ms)
+        | (summary["straightness"] < min_straightness)
+    )
     return summary.sort_values("total_km", ascending=False).reset_index(drop=True)
+
+
+
+# =====================================================================
+# BYU/NIC consolidated Antarctic iceberg database
+# =====================================================================
+
+# Sensors that contribute position fixes, in the order we prefer them
+# when more than one reports on the same day. The scatterometers are
+# listed ahead of "nic" because they are automated daily trackings,
+# whereas the nic column carries the manually-analysed weekly chart
+# position -- both are good, but mixing sources within a track adds
+# jitter, so a consistent preference keeps each track internally
+# coherent.
+BYU_SENSOR_PRIORITY: list[str] = [
+    "ascat", "oscat", "qscat", "seawinds", "nscat", "ers", "sass", "nic",
+]
+
+
+def _byu_decode_date(raw: pd.Series) -> pd.Series:
+    """Decode the BYU YYYYDDD integer date into timestamps.
+
+    The database stores dates as year * 1000 + day-of-year, e.g. 1991314
+    is the 314th day of 1991. Day-of-year is 1-based.
+
+    Args:
+        raw: Integer date column from a BYU CSV.
+
+    Returns:
+        A Series of pandas Timestamps.
+    """
+    year = raw // 1000
+    day_of_year = raw % 1000
+    return pd.to_datetime(year.astype(int).astype(str), format="%Y") + pd.to_timedelta(
+        day_of_year - 1, unit="D"
+    )
+
+
+def load_byu_track(csv_path: str | Path) -> pd.DataFrame:
+    """Load one BYU iceberg CSV into a single-iceberg position track.
+
+    Each row is one day. Position is spread across per-sensor triplets --
+    <sensor>_1 is latitude, <sensor>_2 longitude, <sensor>_3 a validity
+    flag -- with a different sensor populated depending on which
+    satellite saw the berg that day. This collapses them into one
+    lat/lon pair, taking the first sensor in BYU_SENSOR_PRIORITY that
+    reports a valid fix and recording which one it was.
+
+    TWO DATA-QUALITY TRAPS, both handled here:
+
+    1. A validity flag of 1 does NOT guarantee a usable position. About
+       3% of flagged rows carry a literal (0.0, 0.0) -- the null-island
+       sentinel. Latitude 0 is a perfectly legal value, so nothing
+       downstream would reject it; it would simply appear as an Antarctic
+       iceberg teleporting to the equator and back, producing an absurd
+       velocity that would dominate any least-squares calibration.
+       Rows whose fix is exactly (0, 0) are dropped.
+
+    2. size_1 / size_2 are 0 on days when no size was measured, not
+       missing. Zeros become NaN so they are not read as a zero-area
+       iceberg, then carried forward: a berg's dimensions are measured
+       occasionally but apply until re-measured.
+
+    Args:
+        csv_path: Path to one BYU iceberg CSV.
+
+    Returns:
+        A DataFrame with iceberg_id, timestamp, lat, lon, sensor,
+        length_km, width_km, area_km2 -- sorted by time, one row per
+        valid daily fix. Environmental columns are not set here.
+
+    Raises:
+        ValueError: If the file has no recognisable date column.
+    """
+    csv_path = Path(csv_path)
+    raw = pd.read_csv(csv_path)
+    if "date" not in raw.columns:
+        raise ValueError(
+            f"load_byu_track: '{csv_path}' has no 'date' column; found {list(raw.columns)}."
+        )
+
+    present = [s for s in BYU_SENSOR_PRIORITY if f"{s}_3" in raw.columns]
+    lat = pd.Series(np.nan, index=raw.index, dtype=float)
+    lon = pd.Series(np.nan, index=raw.index, dtype=float)
+    sensor = pd.Series("", index=raw.index, dtype=object)
+
+    for name in present:
+        flag = pd.to_numeric(raw[f"{name}_3"], errors="coerce")
+        cand_lat = pd.to_numeric(raw[f"{name}_1"], errors="coerce")
+        cand_lon = pd.to_numeric(raw[f"{name}_2"], errors="coerce")
+        # Trap 1: require the flag AND a position that is not the
+        # null-island sentinel, and only fill rows not already claimed
+        # by a higher-priority sensor.
+        usable = (
+            (flag == 1)
+            & lat.isna()
+            & cand_lat.notna()
+            & cand_lon.notna()
+            & ~((cand_lat == 0.0) & (cand_lon == 0.0))
+        )
+        lat[usable] = cand_lat[usable]
+        lon[usable] = cand_lon[usable]
+        sensor[usable] = name
+
+    # Trap 2: zero means "not measured this day", not "zero size". Some
+    # files in the distribution omit the size columns entirely, so build
+    # an all-NaN Series rather than letting .get() hand back a scalar.
+    def _size_column(name: str) -> pd.Series:
+        if name not in raw.columns:
+            return pd.Series(np.nan, index=raw.index, dtype=float)
+        return pd.to_numeric(raw[name], errors="coerce").replace(0.0, np.nan)
+
+    length_km = _size_column("size_1")
+    width_km = _size_column("size_2")
+
+    track = pd.DataFrame(
+        {
+            "iceberg_id": csv_path.stem.upper(),
+            "timestamp": _byu_decode_date(pd.to_numeric(raw["date"], errors="coerce")),
+            "lat": lat,
+            "lon": lon,
+            "sensor": sensor,
+            "length_km": length_km,
+            "width_km": width_km,
+        }
+    ).dropna(subset=["timestamp", "lat", "lon"])
+
+    track = track[track["lat"].between(-90.0, 90.0) & track["lon"].between(-180.0, 180.0)]
+    track = track.sort_values("timestamp").reset_index(drop=True)
+
+    # Dimensions are measured intermittently; carry the last measurement
+    # forward, then backward for days before the first measurement.
+    for col in ("length_km", "width_km"):
+        track[col] = track[col].ffill().bfill()
+
+    # The project schema speaks in area. BYU reports a bounding length
+    # and width, so area is their product -- an overestimate for a
+    # non-rectangular berg, but consistent across the record and only
+    # ever used as a log-scaled size proxy for the keel.
+    track["area_km2"] = track["length_km"] * track["width_km"]
+    return track
+
+
+
+def resample_track_days(track: pd.DataFrame, days: int) -> pd.DataFrame:
+    """Bin a daily track into multi-day steps using the MEDIAN position per bin.
+
+    Necessary for the BYU record, where satellite position error is
+    comparable to a day's drift, so consecutive daily fixes differenced
+    directly measure mostly noise (see BYU_RESAMPLE_DAYS in config.py).
+
+    Median rather than mean, because the failure mode here is not
+    Gaussian jitter but occasional grossly wrong fixes -- a berg
+    apparently jumping hundreds of kilometres and back. A mean is
+    dragged by those; a median ignores them.
+
+    Environmental columns are averaged rather than medianed: they are
+    smooth model fields with no outlier problem, and the mean is the
+    physically correct summary of forcing over an interval.
+
+    Args:
+        track: A single iceberg's track, one row per day.
+        days: Bin width in days. 1 returns the track unchanged.
+
+    Returns:
+        The binned track, one row per bin, with the same columns.
+    """
+    if days <= 1 or track.empty:
+        return track.reset_index(drop=True)
+
+    df = track.sort_values("timestamp").copy()
+    df["_bin"] = df["timestamp"].dt.floor(f"{days}D")
+
+    how: dict[str, str] = {}
+    for column in df.columns:
+        if column in ("timestamp", "_bin", "iceberg_id"):
+            continue
+        if column in ("lat", "lon", "area_km2", "length_km", "width_km"):
+            how[column] = "median"
+        elif column in ("u_wind", "v_wind", "u_current", "v_current"):
+            how[column] = "mean"
+        else:
+            how[column] = "first"
+
+    binned = df.groupby("_bin", as_index=False).agg(how)
+    binned = binned.rename(columns={"_bin": "timestamp"})
+    if "iceberg_id" in df.columns:
+        binned.insert(0, "iceberg_id", df["iceberg_id"].iloc[0])
+    return binned.reset_index(drop=True)
+
+
+def load_byu_tracks(
+    byu_dir: str | Path | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    min_fixes: int = config.BYU_MIN_FIXES,
+    resample_days: int = config.BYU_RESAMPLE_DAYS,
+) -> dict[str, pd.DataFrame]:
+    """Load every BYU iceberg track that is well observed within a date window.
+
+    Args:
+        byu_dir: Directory of BYU per-iceberg CSVs; defaults to
+            <data>/byu.
+        start_date: Inclusive ISO window start; defaults to
+            config.BYU_START_DATE.
+        end_date: Inclusive ISO window end; defaults to
+            config.BYU_END_DATE.
+        min_fixes: Minimum daily fixes inside the window for an iceberg
+            to be included (counted BEFORE binning).
+        resample_days: Bin width for resample_track_days(); 1 disables
+            binning.
+
+    Returns:
+        A dict of iceberg_id -> track DataFrame, trimmed to the window.
+
+    Raises:
+        FileNotFoundError: If the BYU directory holds no CSVs.
+    """
+    byu_dir = Path(byu_dir) if byu_dir is not None else config.DATA_DIR / config.BYU_DIR_NAME
+    start = pd.Timestamp(start_date or config.BYU_START_DATE)
+    end = pd.Timestamp(end_date or config.BYU_END_DATE)
+
+    paths = sorted(byu_dir.glob(config.BYU_CSV_GLOB))
+    if not paths:
+        raise FileNotFoundError(
+            f"load_byu_tracks: no CSVs found in '{byu_dir}'. Unpack the BYU consolidated "
+            f"Antarctic iceberg database there (one CSV per iceberg, e.g. a23a.csv)."
+        )
+
+    tracks: dict[str, pd.DataFrame] = {}
+    for path in paths:
+        try:
+            track = load_byu_track(path)
+        except (ValueError, KeyError, pd.errors.ParserError):
+            # A handful of files in the distribution have irregular
+            # headers; skipping them is better than failing the batch.
+            continue
+        window = track[(track["timestamp"] >= start) & (track["timestamp"] <= end)]
+        if len(window) >= min_fixes:
+            binned = resample_track_days(window, resample_days)
+            tracks[str(window["iceberg_id"].iloc[0])] = binned
+    return tracks
 
 
 # =====================================================================
@@ -479,7 +743,9 @@ def fetch_era5_wind(
         force_refresh: Re-download even if a cached file exists.
 
     Returns:
-        A sorted list of NetCDF paths covering the requested range.
+        A sorted list of NetCDF paths covering the requested range. The
+        latitude band is part of each filename, so changing the band
+        fetches fresh files rather than silently reusing a narrower one.
 
     Raises:
         RuntimeError: If cdsapi is missing, credentials are not
@@ -518,7 +784,9 @@ def fetch_era5_wind(
 
     paths: list[str] = []
     for chunk_start, chunk_end in _month_chunks(start_date, end_date):
-        path = cache_dir / f"era5_wind_{chunk_start}_{chunk_end}_{grid_deg}deg.nc"
+        path = cache_dir / (
+            f"era5_wind_{chunk_start}_{chunk_end}_{grid_deg}deg_{north}_{south}.nc"
+        )
         if path.exists() and path.stat().st_size > 10_000 and not force_refresh:
             paths.append(str(path))
             continue
@@ -552,7 +820,9 @@ def fetch_era5_wind(
                 f"extending past {latest} will be dropped for lack of wind forcing.",
                 stacklevel=2,
             )
-            path = cache_dir / f"era5_wind_{chunk_start}_{latest}_{grid_deg}deg.nc"
+            path = cache_dir / (
+                f"era5_wind_{chunk_start}_{latest}_{grid_deg}deg_{north}_{south}.nc"
+            )
             if not (path.exists() and path.stat().st_size > 10_000 and not force_refresh):
                 _request(chunk_start, latest, path)
             paths.append(str(path))
@@ -1099,89 +1369,43 @@ def _load_cached_pooled(
     return pooled[POOLED_SCHEMA_COLUMNS]
 
 
-def build_real_dataset(
-    data_dir: str | Path | None = None,
-    include_grounded: bool = False,
-    max_segment_days: float = config.MAX_SEGMENT_DAYS,
-    min_observations: int = 4,
-    cache_dir: str | Path = config.CACHE_DIR,
-    force_refresh: bool = False,
-    verbose: bool = True,
+def _force_and_pool(
+    source: str,
+    tracks: dict[str, pd.DataFrame],
+    summary: pd.DataFrame,
+    snapshots: pd.DataFrame,
+    cache_dir: Path,
+    max_segment_days: float,
+    include_grounded: bool,
+    force_refresh: bool,
+    verbose: bool,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Build the pooled, environmentally-forced real training table end to end.
+    """Attach environmental forcing to every track and pool them into one table.
 
-    Pipeline: read every dated NIC snapshot -> group into per-iceberg
-    tracks -> classify drifting vs grounded -> fetch circumpolar ERA5
-    wind and per-iceberg CMEMS currents -> average both over each
-    inter-fix segment -> concatenate into one pooled table.
-
-    Everything expensive is cached under cache_dir, keyed by its own
-    inputs, so a re-run costs seconds rather than re-downloading.
+    Shared by both position sources: once tracks exist, fetching ERA5
+    wind and per-iceberg ocean currents, averaging them over each
+    segment, filtering unusable rows and concatenating is identical
+    work whether the fixes came from the BYU database or the USNIC
+    snapshots.
 
     Args:
-        data_dir: Directory holding the NIC snapshot CSVs; defaults to
-            config.DATA_DIR.
-        include_grounded: Keep icebergs classified as grounded. Off by
-            default -- see summarize_iceberg_motion() for why they
-            corrupt free-drift residual training.
-        max_segment_days: Drop segments longer than this; a single mean
-            velocity over more than about three weeks is a very weak
-            label and free drift is not meaningful at that timescale.
-        min_observations: Drop icebergs with fewer fixes than this.
+        source: "byu" or "usnic", used in the cache key and messages.
+        tracks: Mapping of iceberg_id -> position track.
+        summary: Motion classification for every track.
+        snapshots: All fixes concatenated, used for the date range.
         cache_dir: Root of the NetCDF/track cache.
+        max_segment_days: Segments longer than this are dropped.
+        include_grounded: Keep icebergs classified as grounded.
         force_refresh: Bypass every cache and re-fetch.
         verbose: Print per-stage progress.
 
     Returns:
-        A (pooled_df, motion_summary) tuple. pooled_df has exactly
-        POOLED_SCHEMA_COLUMNS, sorted by iceberg then time, with no NaN
-        forcing. motion_summary is the full
-        summarize_iceberg_motion() table for EVERY iceberg found,
-        including those excluded -- so the dashboard can still plot the
-        grounded ones and the report can say how many were set aside.
+        A (pooled_df, motion_summary) tuple.
 
     Raises:
-        FileNotFoundError: If no NIC snapshots are found.
-        RuntimeError: If no iceberg survives the filters, or if a data
-            source cannot be fetched.
+        RuntimeError: If no iceberg or no row survives filtering.
     """
     import xarray as xr
-
-    config.ensure_dirs()
-    cache_dir = Path(cache_dir)
-    data_dir = Path(data_dir) if data_dir is not None else config.DATA_DIR
-
-    try:
-        snapshots = load_nic_snapshots(data_dir)
-    except FileNotFoundError:
-        # The NIC snapshot CSVs are the only input that cannot be
-        # regenerated locally -- they are downloaded, not derived. If they
-        # are missing but a previously-built pooled dataset survives in
-        # the cache, use it: the app and every evaluation still work, and
-        # failing outright here would take the whole system down over
-        # source files that only a full rebuild actually needs.
-        recovered = _load_cached_pooled(cache_dir, verbose=verbose)
-        if recovered is None:
-            raise
-        return recovered, summarize_iceberg_motion(
-            {
-                str(berg): group.reset_index(drop=True)[TRACK_SCHEMA_COLUMNS]
-                for berg, group in recovered.groupby("iceberg_id")
-            }
-        )
-    tracks = build_iceberg_tracks(snapshots, min_observations=min_observations)
-    summary = summarize_iceberg_motion(tracks)
-
-    if verbose:
-        n_drift = int((~summary["is_grounded"]).sum())
-        print(
-            f"[data] {len(snapshots)} fixes | {snapshots['timestamp'].nunique()} snapshot dates "
-            f"({snapshots['timestamp'].min():%Y-%m-%d} .. {snapshots['timestamp'].max():%Y-%m-%d})"
-        )
-        print(
-            f"[data] {len(tracks)} icebergs with >= {min_observations} fixes: "
-            f"{n_drift} drifting, {len(summary) - n_drift} grounded/not re-observed"
-        )
 
     keep_ids = set(
         summary["iceberg_id"] if include_grounded else summary.loc[~summary["is_grounded"], "iceberg_id"]
@@ -1199,15 +1423,16 @@ def build_real_dataset(
     end_date = snapshots["timestamp"].max().strftime("%Y-%m-%d")
 
     pooled_key = _cache_key(
-        "pooled", sorted(tracks), start_date, end_date, max_segment_days,
+        "pooled", source, sorted(tracks), start_date, end_date, max_segment_days,
         include_grounded, config.ERA5_GRID_DEG, config.SEGMENT_SAMPLE_HOURS,
     )
-    pooled_path = cache_dir / f"real_track_pooled_{pooled_key}.csv"
+    pooled_path = cache_dir / f"real_track_pooled_{source}_{pooled_key}.csv"
     if pooled_path.exists() and not force_refresh:
         if verbose:
             print(f"[cache] reusing pooled dataset {pooled_path.name}")
         pooled = pd.read_csv(pooled_path, parse_dates=["timestamp"])
-        return pooled[POOLED_SCHEMA_COLUMNS], summary
+        extras = [c for c in BYU_EXTRA_COLUMNS if c in pooled.columns]
+        return pooled[POOLED_SCHEMA_COLUMNS + extras], summary
 
     # ERA5 needs a little slack at the start so the first segment's
     # samples (which begin at the first fix) are inside the archive.
@@ -1241,7 +1466,8 @@ def build_real_dataset(
         with xr.open_dataset(cur_path) as cur_ds:
             forced_track = sample_environment_along_segments(track, wind_ds, cur_ds)
 
-        forced_track.insert(0, "iceberg_id", iceberg_id)
+        if "iceberg_id" not in forced_track.columns:
+            forced_track.insert(0, "iceberg_id", iceberg_id)
         forced.append(forced_track)
 
     wind_ds.close()
@@ -1278,7 +1504,12 @@ def build_real_dataset(
         )
 
     pooled = pooled.sort_values(["iceberg_id", "timestamp"]).reset_index(drop=True)
-    pooled = pooled[POOLED_SCHEMA_COLUMNS]
+    # Core schema first, then whichever metadata columns this source
+    # provided. Downstream code indexes by name and ignores the extras,
+    # so carrying them costs nothing and lets the dashboard show real
+    # iceberg dimensions.
+    extras = [c for c in BYU_EXTRA_COLUMNS if c in pooled.columns]
+    pooled = pooled[POOLED_SCHEMA_COLUMNS + extras]
     pooled.to_csv(pooled_path, index=False)
     if verbose:
         print(
@@ -1286,6 +1517,125 @@ def build_real_dataset(
             f"{pooled['iceberg_id'].nunique()} icebergs -> {pooled_path.name}"
         )
     return pooled, summary
+
+
+def build_real_dataset(
+    source: str = "byu",
+    data_dir: str | Path | None = None,
+    include_grounded: bool = False,
+    max_segment_days: float = config.MAX_SEGMENT_DAYS,
+    min_observations: int = 4,
+    cache_dir: str | Path = config.CACHE_DIR,
+    force_refresh: bool = False,
+    verbose: bool = True,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Build the pooled, environmentally-forced real training table end to end.
+
+    Pipeline: read every dated NIC snapshot -> group into per-iceberg
+    tracks -> classify drifting vs grounded -> fetch circumpolar ERA5
+    wind and per-iceberg CMEMS currents -> average both over each
+    inter-fix segment -> concatenate into one pooled table.
+
+    Everything expensive is cached under cache_dir, keyed by its own
+    inputs, so a re-run costs seconds rather than re-downloading.
+
+    Args:
+        source: "byu" for the consolidated per-iceberg daily database
+            (the default and the primary training source: ~20x more
+            segments, daily rather than weekly, and it carries iceberg
+            dimensions), or "usnic" for the weekly all-iceberg snapshot
+            exports.
+        data_dir: Directory holding the position data; defaults to
+            config.DATA_DIR.
+        include_grounded: Keep icebergs classified as grounded. Off by
+            default -- see summarize_iceberg_motion() for why they
+            corrupt free-drift residual training.
+        max_segment_days: Drop segments longer than this; a single mean
+            velocity over more than about three weeks is a very weak
+            label and free drift is not meaningful at that timescale.
+        min_observations: Drop icebergs with fewer fixes than this.
+        cache_dir: Root of the NetCDF/track cache.
+        force_refresh: Bypass every cache and re-fetch.
+        verbose: Print per-stage progress.
+
+    Returns:
+        A (pooled_df, motion_summary) tuple. pooled_df has exactly
+        POOLED_SCHEMA_COLUMNS, sorted by iceberg then time, with no NaN
+        forcing. motion_summary is the full
+        summarize_iceberg_motion() table for EVERY iceberg found,
+        including those excluded -- so the dashboard can still plot the
+        grounded ones and the report can say how many were set aside.
+
+    Raises:
+        FileNotFoundError: If no NIC snapshots are found.
+        RuntimeError: If no iceberg survives the filters, or if a data
+            source cannot be fetched.
+    """
+    import xarray as xr
+
+    config.ensure_dirs()
+    cache_dir = Path(cache_dir)
+    data_dir = Path(data_dir) if data_dir is not None else config.DATA_DIR
+
+    if source == "byu":
+        tracks = load_byu_tracks(Path(data_dir) / config.BYU_DIR_NAME)
+        if not tracks:
+            raise RuntimeError(
+                f"build_real_dataset: no BYU iceberg has at least {config.BYU_MIN_FIXES} "
+                f"fixes between {config.BYU_START_DATE} and {config.BYU_END_DATE}. Widen "
+                f"the window in config.py, or lower BYU_MIN_FIXES."
+            )
+        for track in tracks.values():
+            for col in ("u_wind", "v_wind", "u_current", "v_current"):
+                track[col] = np.nan
+        summary = summarize_iceberg_motion(tracks)
+        snapshots = pd.concat(tracks.values(), ignore_index=True)
+        return _force_and_pool(
+            source, tracks, summary, snapshots, cache_dir, max_segment_days,
+            include_grounded, force_refresh, verbose,
+        )
+
+    if source != "usnic":
+        raise ValueError(
+            f"build_real_dataset: unknown source={source!r}; expected 'byu' or 'usnic'."
+        )
+
+    try:
+        snapshots = load_nic_snapshots(data_dir)
+    except FileNotFoundError:
+        # The NIC snapshot CSVs are the only input that cannot be
+        # regenerated locally -- they are downloaded, not derived. If they
+        # are missing but a previously-built pooled dataset survives in
+        # the cache, use it: the app and every evaluation still work, and
+        # failing outright here would take the whole system down over
+        # source files that only a full rebuild actually needs.
+        recovered = _load_cached_pooled(cache_dir, verbose=verbose)
+        if recovered is None:
+            raise
+        return recovered, summarize_iceberg_motion(
+            {
+                str(berg): group.reset_index(drop=True)[TRACK_SCHEMA_COLUMNS]
+                for berg, group in recovered.groupby("iceberg_id")
+            }
+        )
+    tracks = build_iceberg_tracks(snapshots, min_observations=min_observations)
+    summary = summarize_iceberg_motion(tracks)
+
+    if verbose:
+        n_drift = int((~summary["is_grounded"]).sum())
+        print(
+            f"[data] {len(snapshots)} fixes | {snapshots['timestamp'].nunique()} snapshot dates "
+            f"({snapshots['timestamp'].min():%Y-%m-%d} .. {snapshots['timestamp'].max():%Y-%m-%d})"
+        )
+        print(
+            f"[data] {len(tracks)} icebergs with >= {min_observations} fixes: "
+            f"{n_drift} drifting, {len(summary) - n_drift} grounded/not re-observed"
+        )
+
+    return _force_and_pool(
+        source, tracks, summary, snapshots, cache_dir, max_segment_days,
+        include_grounded, force_refresh, verbose,
+    )
 
 
 if __name__ == "__main__":
@@ -1296,15 +1646,22 @@ if __name__ == "__main__":
     try:
         pooled, summary = build_real_dataset()
 
-        print("\nMotion classification (all tracked icebergs):")
-        with pd.option_context("display.width", 160, "display.max_rows", 60):
+        print(f"\nMotion classification ({len(summary)} tracked icebergs, "
+              f"{int(summary['is_grounded'].sum())} excluded from drift training):")
+        with pd.option_context("display.width", 200, "display.max_rows", None):
             print(
                 summary[
-                    ["iceberg_id", "n_obs", "total_km", "mean_speed_ms", "mean_area_km2", "is_grounded"]
-                ].to_string(index=False, float_format=lambda v: f"{v:9.4f}")
+                    ["iceberg_id", "n_obs", "total_km", "net_km", "straightness",
+                     "mean_speed_ms", "mean_area_km2", "is_grounded"]
+                ].to_string(index=False, float_format=lambda v: f"{v:9.3f}")
             )
 
-        assert list(pooled.columns) == POOLED_SCHEMA_COLUMNS, "pooled schema mismatch"
+        # The core schema must be present and in order; a source may add
+        # metadata columns after it (BYU supplies length/width/sensor).
+        assert list(pooled.columns)[: len(POOLED_SCHEMA_COLUMNS)] == POOLED_SCHEMA_COLUMNS, (
+            f"pooled schema mismatch: expected {POOLED_SCHEMA_COLUMNS} first, "
+            f"got {list(pooled.columns)}"
+        )
         assert pooled["lat"].between(-90, 90).all(), "lat out of range"
         assert pooled["lon"].between(-180, 180).all(), "lon out of range"
         assert pooled[["u_wind", "v_wind", "u_current", "v_current"]].notna().all().all(), (

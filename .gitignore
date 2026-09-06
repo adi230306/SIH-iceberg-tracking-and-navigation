@@ -1,8 +1,15 @@
+# Stale nested clone left over from an earlier layout. It has its own
+# .git (so git would add it as a broken submodule gitlink) and holds a
+# copy of .cdsapirc. Everything real now lives at the repo root.
+SIH-iceberg-tracking-and-navigation/
+
 # Credentials -- .cdsapirc holds a live CDS API key
 .cdsapirc
 .copernicusmarine*
 
-# Downloaded environmental data (~240 MB, rebuilt from the APIs on demand)
+# Downloaded ERA5 wind and Copernicus current fields (~750 MB). Not
+# committed: they are re-fetched from the APIs on demand, and the
+# pipeline rebuilds them from data/byu when they are absent.
 data/cache/
 
 # Python

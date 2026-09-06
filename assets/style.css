@@ -1,7 +1,7 @@
 /* ---------------------------------------------------------------
    Iceberg Watch — theme
-   Cream base, near-black text/nav, deep green accent.
-   One family (Inter) for everything; a mono face only for the
+   Deep-ocean map, cream page background, near-black text, green
+   accent. One family (Inter) for everything; a mono face only for
    genuinely tabular bits (coordinates, distances, timestamps).
 ------------------------------------------------------------------ */
 
@@ -21,6 +21,14 @@
   --red:       #B23A3A;
   --red-soft:  #FBEAEA;
   --grey-soft: #F0EFEA;
+  --map-bg:    #0B1620;
+
+  --radius-lg: 14px;
+  --radius-md: 10px;
+  --radius-sm: 8px;
+  --shadow-panel: 0 1px 2px rgba(11,15,13,0.04), 0 10px 30px rgba(11,15,13,0.06);
+  --shadow-float: 0 20px 60px rgba(0,0,0,0.28);
+  --ease: 150ms ease;
 }
 
 * { box-sizing: border-box; }
@@ -31,85 +39,20 @@ html, body {
   font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
   font-size: 16px;
   line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
 }
 
 .mono { font-family: 'JetBrains Mono', monospace; }
 
-/* ---------------- Top nav ---------------- */
+/* ---------------- Page shell ---------------- */
 
-.iw-nav {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 20px 40px;
-  border-bottom: 1px solid var(--border);
+.iw-page {
+  max-width: 980px;
+  margin: 0 auto;
+  padding: 32px 24px 64px;
 }
 
-.iw-nav-brand {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  font-weight: 700;
-  font-size: 17px;
-  letter-spacing: -0.01em;
-}
-
-.iw-nav-mark {
-  width: 28px;
-  height: 28px;
-  background: var(--ink);
-  color: #fff;
-  border-radius: 7px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 13px;
-  font-weight: 800;
-}
-
-.iw-nav-links {
-  display: flex;
-  gap: 32px;
-  font-size: 14.5px;
-  color: var(--ink-soft);
-}
-
-.iw-nav-links a { color: inherit; text-decoration: none; }
-.iw-nav-links a:hover { color: var(--ink); }
-
-.iw-nav-cta {
-  background: var(--ink);
-  color: #fff;
-  border: none;
-  border-radius: 8px;
-  padding: 10px 18px;
-  font-size: 14px;
-  font-weight: 600;
-  cursor: pointer;
-}
-
-/* ---------------- Hero ---------------- */
-
-.iw-hero {
-  padding: 56px 40px 40px 40px;
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 48px;
-  align-items: start;
-}
-
-@media (max-width: 980px) {
-  .iw-hero { grid-template-columns: 1fr; }
-}
-
-.iw-eyebrow {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 13.5px;
-  color: var(--ink-soft);
-  margin-bottom: 20px;
-}
+/* ---------------- Live indicator dot (panel header) ---------------- */
 
 .iw-dot {
   width: 7px;
@@ -130,141 +73,14 @@ html, body {
   100% { box-shadow: 0 0 0 0 rgba(27,122,61,0); }
 }
 
-.iw-h1 {
-  font-size: 56px;
-  font-weight: 800;
-  letter-spacing: -0.02em;
-  line-height: 1.05;
-  margin: 0 0 20px 0;
-}
-
-.iw-h1 .accent {
-  color: var(--green);
-}
-
-.iw-sub {
-  font-size: 17px;
-  color: var(--ink-soft);
-  max-width: 46ch;
-  margin-bottom: 28px;
-}
-
-.iw-hero-ctas { display: flex; gap: 12px; margin-bottom: 40px; }
-
-.iw-btn-primary {
-  background: var(--ink);
-  color: #fff;
-  border: none;
-  border-radius: 8px;
-  padding: 13px 20px;
-  font-size: 14.5px;
-  font-weight: 600;
-  cursor: pointer;
-}
-
-.iw-btn-secondary {
-  background: transparent;
-  color: var(--ink);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 13px 20px;
-  font-size: 14.5px;
-  font-weight: 600;
-  cursor: pointer;
-}
-
-.iw-stats {
-  display: flex;
-  gap: 40px;
-  padding-top: 24px;
-  border-top: 1px solid var(--border);
-}
-
-.iw-stat-value {
-  font-size: 24px;
-  font-weight: 800;
-  letter-spacing: -0.01em;
-}
-
-.iw-stat-label {
-  font-size: 12.5px;
-  color: var(--ink-soft);
-  margin-top: 2px;
-}
-
-/* ---------------- Page shell (nav/hero removed) ---------------- */
-
-.iw-page {
-  max-width: 980px;
-  margin: 0 auto;
-  padding: 0 24px;
-}
-
-/* ---------------- Full-screen toggle button ---------------- */
-
-/* Lives inside .iw-map-wrap, so it travels with the map itself and
-   stays reachable whether the panel is at normal size or already
-   expanded to full screen -- no need to hunt for it in a header that
-   might be scrolled out of view. */
-
-.iw-fullscreen-btn {
-  position: absolute;
-  top: 20px;
-  right: 20px;
-  z-index: 5;
-  width: 34px;
-  height: 34px;
-  border-radius: 8px;
-  border: 1px solid var(--border);
-  background: rgba(255,255,255,0.92);
-  color: var(--ink);
-  font-size: 16px;
-  line-height: 1;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-  box-shadow: 0 2px 8px rgba(0,0,0,0.12);
-}
-
-.iw-fullscreen-btn:hover {
-  background: #FFFFFF;
-  border-color: var(--ink);
-}
-
-/* ---------------- Map-only popout ---------------- */
-
-.iw-panel.iw-panel-fullscreen {
-  position: fixed;
-  inset: 20px;
-  z-index: 1000;
-  display: flex;
-  flex-direction: column;
-  box-shadow: 0 20px 60px rgba(0,0,0,0.25);
-}
-
-.iw-panel-fullscreen .iw-panel-head {
-  flex: 0 0 auto;
-}
-
-.iw-panel-fullscreen .iw-map-wrap {
-  flex: 1 1 auto;
-  min-height: 0;
-  height: auto;
-  padding: 12px;
-}
-
-.iw-panel-fullscreen .iw-map-wrap > div {
-  height: 100% !important;
-}
-
 /* ---------------- Live panel ---------------- */
 
 .iw-panel {
   background: var(--panel);
   border: 1px solid var(--border);
-  border-radius: 14px;
+  border-radius: var(--radius-lg);
   overflow: hidden;
+  box-shadow: var(--shadow-panel);
 }
 
 .iw-panel-head {
@@ -283,9 +99,125 @@ html, body {
   gap: 8px;
   font-weight: 600;
   color: var(--ink);
+  letter-spacing: 0.02em;
 }
 
-.iw-map-wrap { position: relative; padding: 10px 10px 0 10px; height: 340px; }
+.iw-map-wrap {
+  position: relative;
+  padding: 10px;
+  height: 340px;
+  background: var(--map-bg);
+}
+
+.iw-map-wrap > div {
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+
+/* Toolbar of icon buttons floating over the map's top-right corner. */
+
+.iw-map-toolbar {
+  position: absolute;
+  top: 20px;
+  right: 20px;
+  z-index: 5;
+  display: flex;
+  gap: 8px;
+}
+
+.iw-map-tool-btn {
+  width: 34px;
+  height: 34px;
+  border-radius: var(--radius-sm);
+  border: 1px solid rgba(255,255,255,0.15);
+  background: rgba(11,22,32,0.75);
+  color: #EDEFEF;
+  font-size: 16px;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.25);
+  backdrop-filter: blur(4px);
+  transition: background var(--ease), border-color var(--ease), transform var(--ease);
+}
+
+.iw-map-tool-btn:hover {
+  background: rgba(11,22,32,0.92);
+  border-color: rgba(255,255,255,0.3);
+  transform: translateY(-1px);
+}
+
+.iw-map-tool-btn.active {
+  background: var(--green);
+  border-color: var(--green);
+  color: #fff;
+}
+
+/* Heatmap metadata card — floats top-left on the map, mirroring the
+   toolbar on the top-right. Only shown while heatmap mode is active. */
+
+.iw-heatmap-meta {
+  position: absolute;
+  top: 20px;
+  left: 20px;
+  z-index: 5;
+  background: rgba(11,22,32,0.75);
+  border: 1px solid rgba(255,255,255,0.15);
+  border-radius: var(--radius-sm);
+  padding: 10px 14px;
+  backdrop-filter: blur(4px);
+  box-shadow: 0 2px 8px rgba(0,0,0,0.25);
+  color: #EDEFEF;
+  font-size: 11.5px;
+  line-height: 1.6;
+  max-width: 220px;
+}
+
+.iw-heatmap-meta-title {
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  color: #3ED67C;
+  margin-bottom: 4px;
+  text-transform: uppercase;
+  font-size: 10.5px;
+}
+
+.iw-heatmap-meta-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-family: 'JetBrains Mono', monospace;
+  color: rgba(237,239,239,0.85);
+}
+
+.iw-heatmap-meta-row span:first-child {
+  font-family: 'Inter', sans-serif;
+  color: rgba(237,239,239,0.55);
+}
+
+/* ---------------- Map-only popout ---------------- */
+
+.iw-panel.iw-panel-fullscreen {
+  position: fixed;
+  inset: 20px;
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  box-shadow: var(--shadow-float);
+}
+
+.iw-panel-fullscreen .iw-panel-head { flex: 0 0 auto; }
+
+.iw-panel-fullscreen .iw-map-wrap {
+  flex: 1 1 auto;
+  min-height: 0;
+  height: auto;
+  padding: 12px;
+}
+
+/* ---------------- Controls ---------------- */
 
 .iw-controls {
   padding: 14px 18px;
@@ -303,7 +235,7 @@ html, body {
   margin-bottom: 6px;
 }
 
-/* Station / forecast list */
+/* ---------------- Forecast step list ---------------- */
 
 .iw-list { max-height: 260px; overflow-y: auto; }
 
@@ -313,10 +245,10 @@ html, body {
   justify-content: space-between;
   padding: 13px 18px;
   border-bottom: 1px solid var(--border);
+  transition: background var(--ease);
 }
 
 .iw-row:last-child { border-bottom: none; }
-
 .iw-row.active { background: var(--green-soft); }
 
 .iw-row-left { display: flex; align-items: baseline; gap: 12px; }
@@ -348,6 +280,7 @@ html, body {
 .iw-pill {
   font-size: 11px;
   font-weight: 700;
+  letter-spacing: 0.02em;
   padding: 4px 10px;
   border-radius: 999px;
   white-space: nowrap;
@@ -369,13 +302,8 @@ html, body {
 
 /* ---------------- Diagnostics section ---------------- */
 
-.iw-section {
-  padding: 32px 0;
-}
-
-.iw-section + .iw-section {
-  border-top: 1px solid var(--border);
-}
+.iw-section { padding: 32px 0; }
+.iw-section + .iw-section { border-top: 1px solid var(--border); }
 
 .iw-section-title {
   font-size: 22px;
@@ -384,7 +312,7 @@ html, body {
   margin-bottom: 16px;
 }
 
-/* Dash core component overrides so they sit quietly inside the theme */
+/* ---------------- Dash core component overrides ---------------- */
 
 .Select-control, ._dash-undo-redo { display: none; }
 
@@ -396,12 +324,24 @@ html, body {
 #horizon-slider .rc-slider-handle,
 #timestep-slider .rc-slider-handle {
   border-color: var(--green);
+  box-shadow: none;
+}
+
+#horizon-slider .rc-slider-handle:hover,
+#timestep-slider .rc-slider-handle:hover {
+  border-color: var(--green-deep);
 }
 
 input[type="number"] {
   border: 1px solid var(--border) !important;
-  border-radius: 8px !important;
+  border-radius: var(--radius-sm) !important;
   padding: 8px 10px !important;
   font-family: 'JetBrains Mono', monospace !important;
   font-size: 13px !important;
+  transition: border-color var(--ease);
+}
+
+input[type="number"]:focus {
+  border-color: var(--green) !important;
+  outline: none;
 }

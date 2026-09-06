@@ -106,11 +106,18 @@ def _normalise_history(
     keys = ("obs_u", "obs_v", "residual_u", "residual_v")
 
     if isinstance(history_window, pd.DataFrame) and not history_window.empty:
-        # Reverse: the frontend's slice runs oldest -> newest.
-        entries = [
-            {k: float(row.get(k, 0.0) or 0.0) for k in keys}
-            for _, row in history_window.iloc[::-1].iterrows()
-        ]
+        # Reverse: the frontend's slice runs oldest -> newest. Rows whose
+        # lag values are not finite are skipped rather than coerced to
+        # zero: when several icebergs are displayed at once their tracks
+        # are concatenated with NaN separator rows to break the map
+        # polylines, and a separator landing inside the history window
+        # would otherwise be read as "the iceberg was stationary", which
+        # is a silently wrong forecast rather than a visible failure.
+        entries = []
+        for _, row in history_window.iloc[::-1].iterrows():
+            values = {k: float(row.get(k, np.nan)) for k in keys}
+            if all(np.isfinite(v) for v in values.values()):
+                entries.append(values)
     elif isinstance(history_window, list) and history_window:
         entries = [{k: float(entry.get(k, 0.0) or 0.0) for k in keys} for entry in history_window]
     else:
@@ -293,9 +300,12 @@ def rollout_forecast(
 
 
 def bootstrap_uncertainty_cone(
+    models: dict | None,
     last_known: pd.Series,
-    future_environment: pd.DataFrame,
-    models: dict | None = None,
+    history_window: pd.DataFrame | list[dict[str, float]] | None = None,
+    future_environment: pd.DataFrame | None = None,
+    feature_cols: list[str] | None = None,
+    dt_seconds: float | None = None,
     drift_params: DriftParams | None = None,
     n_samples: int = 40,
     noise_std_wind: float = 2.5,
@@ -325,10 +335,21 @@ def bootstrap_uncertainty_cone(
     the truth. risk_score()'s model-error floor is what keeps that from
     being read as confidence.
 
+    ARGUMENT ORDER matches rollout_forecast(), so the dashboard can call
+    both the same way:
+
+        bootstrap_uncertainty_cone(model, last_known_row, history_window,
+                                   future_env, feature_cols, dt_seconds, ...)
+
     Args:
+        models: A trained bundle, or None to perturb the physics baseline
+            alone.
         last_known: The iceberg's most recent enriched row.
+        history_window: Lag history; see rollout_forecast().
         future_environment: Forecast forcing per future segment.
-        models: A trained bundle, if forecasting in hybrid mode.
+        feature_cols: Accepted for call compatibility and ignored -- the
+            bundle carries the authoritative column order.
+        dt_seconds: A single segment length applied to every step.
         drift_params: Calibrated drift coefficients.
         n_samples: Number of perturbed rollouts.
         noise_std_wind: Std dev of the wind perturbation, m/s.
@@ -343,6 +364,9 @@ def bootstrap_uncertainty_cone(
         rollout_forecast()'s output. Call cone_envelope() to reduce them
         to a per-timestep spatial envelope for plotting.
     """
+    if future_environment is None:
+        raise ValueError("bootstrap_uncertainty_cone: future_environment is required.")
+
     rng = np.random.default_rng(seed)
     shape = (len(future_environment),)
 
@@ -357,7 +381,10 @@ def bootstrap_uncertainty_cone(
             rollout_forecast(
                 models,
                 last_known,
-                future_environment=perturbed,
+                history_window,
+                perturbed,
+                feature_cols,
+                dt_seconds,
                 drift_params=drift_params,
                 n_lags=n_lags,
                 mode=mode,
@@ -428,21 +455,36 @@ def compute_cpa(
     if forecast.empty:
         raise ValueError("compute_cpa: the forecast track is empty.")
 
+    # A multi-iceberg forecast is several tracks concatenated with NaN
+    # separator rows (they make the map draw one polyline per iceberg).
+    # Drop those before measuring distance, and the CPA then correctly
+    # becomes the closest approach of ANY forecast iceberg -- which is
+    # the question a bridge officer is actually asking.
+    points = forecast.dropna(subset=["lat", "lon"]).reset_index(drop=True)
+    if points.empty:
+        raise ValueError("compute_cpa: the forecast track has no valid positions.")
+
     distances = np.array(
         [
             geodesic_distance_km(lat, lon, vessel_lat, vessel_lon)
-            for lat, lon in zip(forecast["lat"], forecast["lon"])
+            for lat, lon in zip(points["lat"], points["lon"])
         ]
     )
     idx = int(np.argmin(distances))
-    cpa_time = pd.Timestamp(forecast["timestamp"].iloc[idx])
-    origin = pd.Timestamp(forecast["timestamp"].iloc[0])
+    cpa_time = pd.Timestamp(points["timestamp"].iloc[idx])
+    origin = pd.Timestamp(points["timestamp"].iloc[0])
 
     return {
         "cpa_distance_km": float(distances[idx]),
         "cpa_timestamp": cpa_time,
         "time_to_cpa_hours": float((cpa_time - origin).total_seconds() / 3600.0),
         "cpa_step_index": idx,
+        # Which iceberg makes the closest approach, when several are
+        # forecast together.
+        "cpa_iceberg_id": (
+            str(points["iceberg_id"].iloc[idx])
+            if "iceberg_id" in points.columns else None
+        ),
     }
 
 
@@ -587,7 +629,8 @@ if __name__ == "__main__":
     print(forecast.to_string(index=False))
 
     cone = bootstrap_uncertainty_cone(
-        last_known, future_env, drift_params=params, mode="physics", n_samples=40
+        None, last_known, future_environment=future_env,
+        drift_params=params, mode="physics", n_samples=40
     )
     envelope = cone_envelope(cone)
     print(f"\nUncertainty cone ({len(cone)} perturbed rollouts):")

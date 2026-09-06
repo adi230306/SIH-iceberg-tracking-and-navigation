@@ -624,11 +624,16 @@ def select_forecast_mode(
             f"({physics_ade:.1f} -> {hybrid_ade:.1f} km), above the {min_improvement_pct:.0f}% "
             f"bar; the hybrid is used for forecasting."
         )
+    verdict = (
+        f"is {-improvement:.1f}% WORSE than"
+        if improvement < 0
+        else f"is only {improvement:.1f}% better than"
+    )
     return "physics", (
-        f"The learned residual changes held-out ADE by only {-improvement:+.1f}% "
-        f"({physics_ade:.1f} -> {hybrid_ade:.1f} km), below the {min_improvement_pct:.0f}% "
-        f"bar for this dataset size. Forecasts use calibrated physics alone; the trained "
-        f"model is still saved so the comparison can be re-run as the record grows."
+        f"The learned residual {verdict} calibrated physics on held-out icebergs "
+        f"({physics_ade:.1f} -> {hybrid_ade:.1f} km ADE), short of the "
+        f"{min_improvement_pct:.0f}% bar. Forecasts use calibrated physics alone; the "
+        f"trained model is still saved so the comparison can be re-run as the record grows."
     )
 
 

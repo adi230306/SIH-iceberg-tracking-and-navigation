@@ -170,6 +170,14 @@ def compute_observed_velocity(
 
     df = df.dropna(subset=["obs_u", "obs_v"]).reset_index(drop=True)
 
+    # Reject segments implying a physically impossible speed. These are
+    # bad position fixes, not fast icebergs, and a single one of them
+    # dominates a least-squares calibration: the raw BYU daily record has
+    # a median speed of 0.037 m/s but an RMS of 0.28 m/s entirely because
+    # of this tail.
+    speed = np.hypot(df["obs_u"], df["obs_v"])
+    df = df.loc[speed < config.MAX_PLAUSIBLE_SPEED_MS].reset_index(drop=True)
+
     # Verify the forcing on each row really covers the interval its
     # velocity was measured over (see the docstring).
     if "segment_hours" in df.columns:
