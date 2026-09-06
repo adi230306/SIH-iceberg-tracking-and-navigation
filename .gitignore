@@ -10,7 +10,14 @@ SIH-iceberg-tracking-and-navigation/
 # Downloaded ERA5 wind and Copernicus current fields (~750 MB). Not
 # committed: they are re-fetched from the APIs on demand, and the
 # pipeline rebuilds them from data/byu when they are absent.
-data/cache/
+# The trailing /* matters: excluding the DIRECTORY itself would stop git
+# from ever looking inside it, so the negation below could not re-include
+# anything.
+data/cache/*
+# ...except the pooled dataset. It is a few hundred KB, and with it
+# present the pipeline short-circuits before any API call -- which is
+# what lets a deployed copy run with no CDS or Copernicus credentials.
+!data/cache/real_track_pooled_byu_*.csv
 
 # Python
 __pycache__/

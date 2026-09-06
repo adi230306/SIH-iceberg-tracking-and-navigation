@@ -1,0 +1,13 @@
+# The NetCDF cache is ~750 MB and is not needed at runtime: the pooled
+# dataset under data/cache is what the app actually reads.
+data/cache/era5/
+data/cache/currents/
+data/cache/*.nc
+
+.git/
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+.cdsapirc
+SIH-iceberg-tracking-and-navigation/

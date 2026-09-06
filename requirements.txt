@@ -25,3 +25,6 @@ copernicusmarine>=2.0  # CMEMS currents -- needs `copernicusmarine login`
 dash>=3.0
 dash-bootstrap-components>=2.0
 plotly>=6.0
+
+# Production WSGI server (hosting; not needed for local `python main.py`)
+gunicorn>=21.2

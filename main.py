@@ -1286,5 +1286,17 @@ def create_app() -> Dash:
 
 app = create_app()
 
+# WSGI entry point for a production server (gunicorn main:server). Dash
+# builds on Flask, and `app.run` above is the development server only --
+# it is single-threaded and explicitly not for hosting.
+server = app.server
+
 if __name__ == "__main__":
-    app.run(debug=True)
+    # Defaults are the local development ones. A host reaching in through
+    # the environment gets 0.0.0.0 and its own port, and debug off, so the
+    # same file serves both without a separate production entry point.
+    app.run(
+        host=os.environ.get("HOST", "127.0.0.1"),
+        port=int(os.environ.get("PORT", "8050")),
+        debug=os.environ.get("DASH_DEBUG", "1") == "1",
+    )
