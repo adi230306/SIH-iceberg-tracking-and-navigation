@@ -1202,10 +1202,15 @@ def _hero_stats(metadata: pd.DataFrame, metrics: dict) -> list[tuple[str, str]]:
         # re-binned, and a forecast error means nothing without its horizon.
         label = f"{days:.0f}-day forecast error" if days else "forecast error"
         stats.append((f"{physics:.0f} km", label))
-    if skill is not None:
-        stats.append((f"{skill:.0f}%", "better than persistence"))
+    # Two performance figures, both point-in-fact and precisely labelled.
+    # "Better than persistence" is deliberately NOT the headline: on this
+    # record persistence is itself worse than assuming the iceberg never
+    # moves, so a big number against it would flatter the model.
     if accuracy is not None:
         stats.append((f"{accuracy:.0f}%", "of movement predicted"))
+    hit = metrics.get("_hit50_pct")
+    if hit is not None:
+        stats.append((f"{hit:.0f}%", "forecasts within 50 km"))
     return stats
 
 
@@ -1237,7 +1242,8 @@ def _compute_metrics(pooled: pd.DataFrame, force: bool = False, horizon_days: fl
         # Shown in the hero. Kept out of the chart dict consumed by
         # build_diagnostics_figure, which plots every key it is given as a
         # bar -- these are percentages and kilometres, not comparable.
-        "_accuracy_pct": round(aggregate[best]["accuracy_pct"], 0),
+        "_accuracy_pct": round(aggregate[best]["accuracy_vs_path_pct"], 0),
+        "_hit50_pct": round(aggregate[best]["hit_rate_50km"], 0),
         "_skill_pct": round(aggregate[best]["skill_vs_persistence_pct"], 0),
         "_moved_km": round(aggregate[best]["actual_displacement_km"], 1),
         "_horizon_days": round(horizon_days, 0),

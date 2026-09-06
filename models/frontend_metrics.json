@@ -2,7 +2,8 @@
   "persistence": 102.6,
   "physics_only": 61.9,
   "hybrid": 63.6,
-  "_accuracy_pct": 11.0,
+  "_accuracy_pct": 45.0,
+  "_hit50_pct": 58.0,
   "_skill_pct": 40.0,
   "_moved_km": 69.2,
   "_horizon_days": 14.0

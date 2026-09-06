@@ -390,6 +390,10 @@ def evaluate_trajectory(
     # 8 km miss means something quite different on a berg that moved 200 km
     # than on one that moved 10 km.
     actual_displacements_km: list[float] = []
+    # Path length actually walked over the rollout, and the per-rollout
+    # final errors, so alternative skill denominators can be compared.
+    actual_paths_km: list[float] = []
+    final_errors_km: list[float] = []
     n_rollouts = 0
     icebergs_used: set[str] = set()
 
@@ -487,6 +491,14 @@ def evaluate_trajectory(
             # Straight-line distance from where the rollout started to
             # where the iceberg really ended up.
             final = berg.iloc[start + horizon_steps]
+            path = 0.0
+            for k in range(start, start + horizon_steps):
+                path += geodesic_distance_km(
+                    float(berg["lat"].iloc[k]), float(berg["lon"].iloc[k]),
+                    float(berg["lat"].iloc[k + 1]), float(berg["lon"].iloc[k + 1]),
+                )
+            actual_paths_km.append(path)
+            final_errors_km.append(step_errors[-1][-1])
             actual_displacements_km.append(
                 geodesic_distance_km(
                     float(berg["lat"].iloc[start]), float(berg["lon"].iloc[start]),
@@ -518,8 +530,16 @@ def evaluate_trajectory(
     else:
         accuracy_pct = float("nan")
 
+    path_km = float(np.mean(actual_paths_km)) if actual_paths_km else float("nan")
+    errs = np.array(final_errors_km) if final_errors_km else np.array([np.nan])
     return {
         "mode": mode,
+        "actual_path_km": path_km,
+        "accuracy_vs_path_pct": float(np.clip(100.0 * (1.0 - fde_km / path_km), 0.0, 100.0))
+        if np.isfinite(path_km) and path_km > 0 else float("nan"),
+        "hit_rate_25km": float(100.0 * np.mean(errs < 25)),
+        "hit_rate_50km": float(100.0 * np.mean(errs < 50)),
+        "hit_rate_100km": float(100.0 * np.mean(errs < 100)),
         "ade_km": float(np.mean(flat)) if flat else float("nan"),
         "fde_km": fde_km,
         "per_step_km": [float(np.mean(s)) if s else float("nan") for s in step_errors],
@@ -600,6 +620,9 @@ def leave_one_iceberg_out(
                 **{f"{mode}_ade_km": result[mode]["ade_km"] for mode in result},
                 **{f"{mode}_fde_km": result[mode]["fde_km"] for mode in result},
                 **{f"{mode}_accuracy_pct": result[mode]["accuracy_pct"] for mode in result},
+                **{f"{mode}_path_pct": result[mode]["accuracy_vs_path_pct"] for mode in result},
+                **{f"{mode}_hit50": result[mode]["hit_rate_50km"] for mode in result},
+                "path_km": result["physics"]["actual_path_km"],
             }
         )
         if verbose:
@@ -634,6 +657,16 @@ def leave_one_iceberg_out(
             "accuracy_pct": float(np.clip(100.0 * (1.0 - fde / moved), 0.0, 100.0))
             if moved > 0 else float("nan"),
             "actual_displacement_km": moved,
+            "actual_path_km": float(np.average(per_iceberg["path_km"], weights=weights)),
+            # Same idea as accuracy_pct, but measured against the distance
+            # the iceberg actually TRAVELLED rather than how far it netted
+            # out. Both are honest; this one answers "how much of the
+            # movement did we capture", the other "how much better than
+            # assuming it never moved". Quote whichever you mean, labelled.
+            "accuracy_vs_path_pct": float(np.average(
+                per_iceberg[f"{mode}_path_pct"], weights=weights)),
+            "hit_rate_50km": float(np.average(
+                per_iceberg[f"{mode}_hit50"], weights=weights)),
             # Forecast SKILL: how much of persistence's error this model
             # removes. The standard score in forecasting, and the fairer
             # headline of the two -- accuracy_pct above is measured

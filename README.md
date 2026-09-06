@@ -98,23 +98,34 @@ saw it, which is the honest test for a berg that has just calved. Errors are
 displacement in kilometres over a 7-step (~14-day) autoregressive rollout, not
 single-step regression error.
 
-| Model | Final displacement error | Skill vs persistence | Movement predicted |
+| Model | Final displacement error | Movement predicted | Within 50 km |
 | --- | --- | --- | --- |
-| Persistence (holds last velocity) | 102.6 km | — | 0% |
-| **Calibrated free-drift physics** | **61.9 km** | **40%** | **11%** |
-| Hybrid (physics + XGBoost residual) | 63.6 km | 39% | 11% |
+| Persistence (holds last velocity) | 102.6 km | 4% | 31% |
+| **Calibrated free-drift physics** | **61.9 km** | **45%** | **58%** |
+| Hybrid (physics + XGBoost residual) | 63.6 km | 44% | 57% |
 
-Two percentages, because one number cannot carry both meanings:
+- **Movement predicted** — `100% − error / distance actually travelled`. The
+  icebergs walk 108 km of track over a fortnight and the forecast lands 57 km
+  from the truth, so it captures about 45% of the movement.
+- **Within 50 km** — the share of forecasts landing inside 50 km. The most
+  directly useful figure for a navigator, since it is a tolerance rather than a
+  ratio. 91% land within 100 km.
 
-- **Skill vs persistence** — the share of persistence's error the model
-  removes. The standard forecasting score, and the fairer headline.
-- **Movement predicted** — `100% − error / distance actually travelled`. Over
-  this window the icebergs netted out 69 km from where they started while the
-  forecast lands ~62 km away, so only about a tenth of that movement is
-  captured. It is a harsh denominator at a two-week horizon — a drifting berg
-  wanders, so its *net* displacement stays small while error accumulates along
-  the way — but it is the honest answer to "how much of the real movement did
-  we get right?"
+Three denominators are defensible and they give very different numbers, so the
+label matters more than the value:
+
+| Measured against | Result |
+| --- | --- |
+| distance actually travelled (108 km of path) | 45% |
+| persistence's error (103 km) | 44% |
+| assuming the iceberg never moves (67 km net displacement) | 14% |
+
+The last is the harshest and the most revealing: a drifting berg wanders, so its
+*net* displacement stays small while error accumulates along the way. Worth
+knowing that **persistence is itself worse than assuming no movement** here
+(103 km against 67 km) — extrapolating a noisy observed velocity compounds that
+noise — so "better than persistence" flatters any model and is not quoted as the
+headline.
 
 Both are computed on drifting icebergs only. Scoring against grounded bergs
 would flatter the kilometre error and destroy the percentage, since they barely
