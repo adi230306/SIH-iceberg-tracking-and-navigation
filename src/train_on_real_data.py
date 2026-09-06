@@ -37,7 +37,9 @@ from train_model import (
 )
 
 
-def _print_comparison(title: str, results: dict[str, dict], horizon_steps: int) -> None:
+def _print_comparison(
+    title: str, results: dict[str, dict], horizon_steps: int, step_days: float = 1.0
+) -> None:
     """Print one ADE/FDE comparison table across the three forecast modes.
 
     Args:
@@ -51,10 +53,13 @@ def _print_comparison(title: str, results: dict[str, dict], horizon_steps: int) 
     any_result = next(iter(results.values()))
     print()
     print("=" * 72)
-    print(f"{title}  --  {horizon_steps}-step (~{horizon_steps} week) rollout, "
+    # Label the horizon in DAYS. A "step" is one row of the record, whose
+    # spacing depends on config.BYU_RESAMPLE_DAYS, so quoting steps alone
+    # (or assuming weeks, as this once did) misstates the horizon.
+    print(f"{title}  --  {horizon_steps}-step (~{horizon_steps * step_days:.0f}-day) rollout, "
           f"{any_result['n_rollouts']} forecasts")
     print("=" * 72)
-    print(f"{'Model':<28}{'ADE (km)':>12}{'FDE (km)':>12}{'vs physics':>16}")
+    print(f"{'Model':<28}{'ADE (km)':>12}{'FDE (km)':>12}{'Accuracy':>10}{'Skill':>8}{'vs phys':>10}")
     print("-" * 72)
 
     physics_ade = results.get("physics", {}).get("ade_km", float("nan"))
@@ -72,8 +77,18 @@ def _print_comparison(title: str, results: dict[str, dict], horizon_steps: int) 
         else:
             change = 100.0 * (res["ade_km"] - physics_ade) / physics_ade
             delta = f"{change:+.1f}%"
-        print(f"{labels[mode]:<28}{res['ade_km']:>12.2f}{res['fde_km']:>12.2f}{delta:>16}")
+        accuracy = res.get("accuracy_pct", float("nan"))
+        skill = res.get("skill_vs_persistence_pct", float("nan"))
+        accuracy_text = f"{accuracy:.0f}%" if np.isfinite(accuracy) else "--"
+        skill_text = f"{skill:.0f}%" if np.isfinite(skill) else "--"
+        print(f"{labels[mode]:<28}{res['ade_km']:>12.2f}{res['fde_km']:>12.2f}"
+              f"{accuracy_text:>10}{skill_text:>8}{delta:>10}")
     print("-" * 72)
+    moved = any_result.get("actual_displacement_km")
+    if moved and np.isfinite(moved):
+        print(f"Icebergs actually moved {moved:.1f} km (net) over this window.")
+        print("Accuracy = share of that movement predicted correctly (100% - error/movement).")
+        print("Skill    = share of persistence's error removed -- the standard forecast score.")
 
     steps = results.get("hybrid", any_result)["per_step_km"]
     # The aggregated leave-one-out block has no meaningful per-step
@@ -181,10 +196,12 @@ def main(
         )
         for mode in ("persistence", "physics", "hybrid")
     }
+    step_days = float(pooled["segment_hours"].median()) / 24.0
     _print_comparison(
         f"SPLIT BY TIME  (train < {cutoff:%Y-%m-%d}, {len(train_features)} rows)",
         time_results,
         horizon_steps,
+        step_days,
     )
 
     # --- 4. Leave-one-iceberg-out ------------------------------------
@@ -199,7 +216,7 @@ def main(
         _print_comparison("LEAVE-ONE-ICEBERG-OUT AGGREGATE",
                           {m: {**loio[m], "per_step_km": [float("nan")] * horizon_steps}
                            for m in loio},
-                          horizon_steps)
+                          horizon_steps, step_days)
 
     # --- 5. Decide whether the ML stage has earned its place ---------
     forecast_mode, rationale = select_forecast_mode(loio)

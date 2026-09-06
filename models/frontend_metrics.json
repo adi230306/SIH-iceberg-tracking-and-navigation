@@ -1,5 +1,9 @@
 {
   "persistence": 102.6,
   "physics_only": 61.9,
-  "hybrid": 63.6
+  "hybrid": 63.6,
+  "_accuracy_pct": 11.0,
+  "_skill_pct": 40.0,
+  "_moved_km": 69.2,
+  "_horizon_days": 14.0
 }

@@ -1188,17 +1188,28 @@ def _hero_stats(metadata: pd.DataFrame, metrics: dict) -> list[tuple[str, str]]:
     """
     drifting = int((~metadata["is_grounded"].fillna(False)).sum()) if "is_grounded" in metadata else len(metadata)
     physics = metrics.get("physics_only")
-    persistence = metrics.get("persistence")
+    days = metrics.get("_horizon_days")
+    accuracy = metrics.get("_accuracy_pct")
+    skill = metrics.get("_skill_pct")
 
-    stats = [(str(len(metadata)), "icebergs tracked"), (str(drifting), "actively drifting")]
+    # Four figures, not five: the strip is a single row in the hero and a
+    # fifth forces the values to wrap. "Actively drifting" is the one that
+    # goes -- it is already visible per-iceberg in the metadata panel.
+    stats = [(f"{len(metadata)}", "icebergs tracked")]
     if physics:
-        stats.append((f"{physics:.0f} km", "7-day forecast error"))
-    if physics and persistence:
-        stats.append((f"{persistence / physics:.1f}\u00d7", "better than persistence"))
+        # Quote the horizon in days, computed from the record's own step
+        # length -- hard-coding "7-day" was wrong once the record was
+        # re-binned, and a forecast error means nothing without its horizon.
+        label = f"{days:.0f}-day forecast error" if days else "forecast error"
+        stats.append((f"{physics:.0f} km", label))
+    if skill is not None:
+        stats.append((f"{skill:.0f}%", "better than persistence"))
+    if accuracy is not None:
+        stats.append((f"{accuracy:.0f}%", "of movement predicted"))
     return stats
 
 
-def _compute_metrics(pooled: pd.DataFrame, force: bool = False) -> dict:
+def _compute_metrics(pooled: pd.DataFrame, force: bool = False, horizon_days: float = 14.0) -> dict:
     """Produce the diagnostics-chart numbers, caching them between runs.
 
     The chart compares final displacement error across the three forecast
@@ -1218,10 +1229,18 @@ def _compute_metrics(pooled: pd.DataFrame, force: bool = False) -> dict:
             return json.load(handle)
 
     _per_iceberg, aggregate = train_model.leave_one_iceberg_out(pooled, verbose=False)
+    best = "hybrid" if aggregate["hybrid"]["fde_km"] < aggregate["physics"]["fde_km"] else "physics"
     metrics = {
         "persistence": round(aggregate["persistence"]["fde_km"], 1),
         "physics_only": round(aggregate["physics"]["fde_km"], 1),
         "hybrid": round(aggregate["hybrid"]["fde_km"], 1),
+        # Shown in the hero. Kept out of the chart dict consumed by
+        # build_diagnostics_figure, which plots every key it is given as a
+        # bar -- these are percentages and kilometres, not comparable.
+        "_accuracy_pct": round(aggregate[best]["accuracy_pct"], 0),
+        "_skill_pct": round(aggregate[best]["skill_vs_persistence_pct"], 0),
+        "_moved_km": round(aggregate[best]["actual_displacement_km"], 1),
+        "_horizon_days": round(horizon_days, 0),
     }
     os.makedirs(config.MODELS_DIR, exist_ok=True)
     with open(METRICS_PATH, "w") as handle:
@@ -1246,10 +1265,18 @@ def create_app() -> Dash:
     _bind_multi_forecast(default_id)
 
     metadata = _metadata_table(enriched, motion)
-    pooled_core = enriched[
-        [c for c in data_ingest.POOLED_SCHEMA_COLUMNS if c in enriched.columns]
+    # Evaluate on DRIFTING icebergs only, matching what the model was
+    # fitted on. Scoring against grounded bergs would be meaningless --
+    # they barely move, so they drag the "distance actually travelled"
+    # denominator toward zero and make the accuracy figure a statement
+    # about stationary ice rather than about forecast quality.
+    drifting_ids = set(motion.loc[~motion["is_grounded"].fillna(False), "iceberg_id"])
+    pooled_core = enriched.loc[
+        enriched["iceberg_id"].isin(drifting_ids),
+        [c for c in data_ingest.POOLED_SCHEMA_COLUMNS if c in enriched.columns],
     ]
-    metrics = _compute_metrics(pooled_core)
+    step_days = float(pooled_core["segment_hours"].median()) / 24.0
+    metrics = _compute_metrics(pooled_core, horizon_days=step_days * config.DEFAULT_HORIZON_STEPS)
 
     # An explicit DEFAULT_ICEBERGS list wins; otherwise pick the
     # tightest cluster of drifting bergs, so the opening map is framed on
@@ -1279,7 +1306,9 @@ def create_app() -> Dash:
                   f"{pooled_core['timestamp'].max():%d %b %Y}",
     )
 
-    register_callbacks(app, bundle, metrics)
+    # Underscore-prefixed entries are hero copy, not chart series.
+    chart_metrics = {k: v for k, v in metrics.items() if not k.startswith('_')}
+    register_callbacks(app, bundle, chart_metrics)
     _register_extra_callbacks(app, metadata, bundle, feature_df, default_id)
     return app
 

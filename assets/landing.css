@@ -246,12 +246,15 @@
 /* Everything below the live panel is noise at preview size. */
 .ib-view-landing .ib-stage-inner .iw-section + .iw-section { display: none; }
 
-/* No fullscreen control on the landing page. The preview is meant to be
-   opened, not expanded in place -- and the dashboard's fullscreen style
-   is `position: fixed; inset: 20px`, so triggering it from here would
-   throw the panel over the whole landing page with no way back to it.
-   The button returns in the open view, where it belongs. */
-.ib-view-landing .ib-stage-inner #fullscreen-btn { display: none; }
+/* No map controls on the landing page. The preview is meant to be
+   opened, not operated in place: the whole card is a click target, so a
+   button competing with it is a trap. Fullscreen is worse than merely
+   confusing -- the dashboard's fullscreen style is `position: fixed;
+   inset: 20px`, so triggering it from here would throw the panel over
+   the entire landing page with no way back. Both return in the open
+   view, where they belong. */
+.ib-view-landing .ib-stage-inner #fullscreen-btn,
+.ib-view-landing .ib-stage-inner #heatmap-btn { display: none; }
 
 /* --- open view -------------------------------------------------- */
 .ib-view-open .ib-hero {

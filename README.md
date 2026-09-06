@@ -98,11 +98,28 @@ saw it, which is the honest test for a berg that has just calved. Errors are
 displacement in kilometres over a 7-step (~14-day) autoregressive rollout, not
 single-step regression error.
 
-| Model | Final displacement error |
-| --- | --- |
-| Persistence (holds last velocity) | 102.6 km |
-| **Calibrated free-drift physics** | **61.9 km** |
-| Hybrid (physics + XGBoost residual) | 63.6 km |
+| Model | Final displacement error | Skill vs persistence | Movement predicted |
+| --- | --- | --- | --- |
+| Persistence (holds last velocity) | 102.6 km | — | 0% |
+| **Calibrated free-drift physics** | **61.9 km** | **40%** | **11%** |
+| Hybrid (physics + XGBoost residual) | 63.6 km | 39% | 11% |
+
+Two percentages, because one number cannot carry both meanings:
+
+- **Skill vs persistence** — the share of persistence's error the model
+  removes. The standard forecasting score, and the fairer headline.
+- **Movement predicted** — `100% − error / distance actually travelled`. Over
+  this window the icebergs netted out 69 km from where they started while the
+  forecast lands ~62 km away, so only about a tenth of that movement is
+  captured. It is a harsh denominator at a two-week horizon — a drifting berg
+  wanders, so its *net* displacement stays small while error accumulates along
+  the way — but it is the honest answer to "how much of the real movement did
+  we get right?"
+
+Both are computed on drifting icebergs only. Scoring against grounded bergs
+would flatter the kilometre error and destroy the percentage, since they barely
+move: the denominator collapses and the figure stops being about forecast
+quality at all.
 
 Two findings worth stating plainly:
 

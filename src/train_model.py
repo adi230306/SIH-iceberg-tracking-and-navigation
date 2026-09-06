@@ -385,6 +385,11 @@ def evaluate_trajectory(
 
     max_segment_hours = config.MAX_SEGMENT_DAYS * 24.0
     step_errors: list[list[float]] = [[] for _ in range(horizon_steps)]
+    # How far the iceberg ACTUALLY moved over each rollout window. This is
+    # the denominator that turns a kilometre error into a percentage: an
+    # 8 km miss means something quite different on a berg that moved 200 km
+    # than on one that moved 10 km.
+    actual_displacements_km: list[float] = []
     n_rollouts = 0
     icebergs_used: set[str] = set()
 
@@ -479,15 +484,47 @@ def evaluate_trajectory(
                 history = history[:n_lags]
                 current_lat, current_lon = forecast_lat, forecast_lon
 
+            # Straight-line distance from where the rollout started to
+            # where the iceberg really ended up.
+            final = berg.iloc[start + horizon_steps]
+            actual_displacements_km.append(
+                geodesic_distance_km(
+                    float(berg["lat"].iloc[start]), float(berg["lon"].iloc[start]),
+                    float(final["lat"]), float(final["lon"]),
+                )
+            )
             n_rollouts += 1
             icebergs_used.add(str(iceberg_id))
 
     flat = [e for step in step_errors for e in step]
+    fde_km = float(np.mean(step_errors[-1])) if step_errors[-1] else float("nan")
+    moved_km = float(np.mean(actual_displacements_km)) if actual_displacements_km else float("nan")
+
+    # ACCURACY AS A PERCENTAGE.
+    #
+    # Reported as a ratio of means rather than a mean of per-rollout
+    # ratios. A berg that barely moved gives a denominator near zero, and
+    # averaging those individually would let a handful of near-stationary
+    # rollouts dominate -- or produce large negative numbers -- while
+    # saying nothing about forecast quality. Pooling first weights each
+    # rollout by how much movement there actually was to get right.
+    #
+    # Read it as: "of the distance the iceberg actually travelled, this
+    # much was predicted correctly." 100% is a perfect forecast; 0% means
+    # the error is as large as the movement itself, i.e. no better than
+    # asserting the berg never moved.
+    if np.isfinite(fde_km) and np.isfinite(moved_km) and moved_km > 0:
+        accuracy_pct = float(np.clip(100.0 * (1.0 - fde_km / moved_km), 0.0, 100.0))
+    else:
+        accuracy_pct = float("nan")
+
     return {
         "mode": mode,
         "ade_km": float(np.mean(flat)) if flat else float("nan"),
-        "fde_km": float(np.mean(step_errors[-1])) if step_errors[-1] else float("nan"),
+        "fde_km": fde_km,
         "per_step_km": [float(np.mean(s)) if s else float("nan") for s in step_errors],
+        "actual_displacement_km": moved_km,
+        "accuracy_pct": accuracy_pct,
         "n_rollouts": n_rollouts,
         "n_icebergs": len(icebergs_used),
         "horizon_steps": horizon_steps,
@@ -559,8 +596,10 @@ def leave_one_iceberg_out(
             {
                 "iceberg_id": held_out,
                 "n_rollouts": result["physics"]["n_rollouts"],
+                "moved_km": result["physics"]["actual_displacement_km"],
                 **{f"{mode}_ade_km": result[mode]["ade_km"] for mode in result},
                 **{f"{mode}_fde_km": result[mode]["fde_km"] for mode in result},
+                **{f"{mode}_accuracy_pct": result[mode]["accuracy_pct"] for mode in result},
             }
         )
         if verbose:
@@ -578,14 +617,35 @@ def leave_one_iceberg_out(
     # Weight by rollout count so a berg contributing eight forecasts
     # counts eight times as much as one contributing a single forecast.
     weights = per_iceberg["n_rollouts"].to_numpy(dtype=float)
-    aggregate = {
-        mode: {
+    moved = float(np.average(per_iceberg["moved_km"], weights=weights))
+    persistence_fde = float(
+        np.average(per_iceberg["persistence_fde_km"], weights=weights)
+    )
+    aggregate = {}
+    for mode in ("persistence", "physics", "hybrid"):
+        fde = float(np.average(per_iceberg[f"{mode}_fde_km"], weights=weights))
+        aggregate[mode] = {
             "ade_km": float(np.average(per_iceberg[f"{mode}_ade_km"], weights=weights)),
-            "fde_km": float(np.average(per_iceberg[f"{mode}_fde_km"], weights=weights)),
+            "fde_km": fde,
+            # Recomputed from the pooled figures rather than averaging the
+            # per-iceberg percentages: the same weighting argument as in
+            # evaluate_trajectory, since a barely-moving iceberg would
+            # otherwise carry the same weight as one that crossed an ocean.
+            "accuracy_pct": float(np.clip(100.0 * (1.0 - fde / moved), 0.0, 100.0))
+            if moved > 0 else float("nan"),
+            "actual_displacement_km": moved,
+            # Forecast SKILL: how much of persistence's error this model
+            # removes. The standard score in forecasting, and the fairer
+            # headline of the two -- accuracy_pct above is measured
+            # against how far the iceberg netted out, which at a two-week
+            # horizon is a harsh denominator because a drifting berg
+            # wanders and its net displacement stays small while error
+            # accumulates.
+            "skill_vs_persistence_pct": float(
+                np.clip(100.0 * (1.0 - fde / persistence_fde), 0.0, 100.0)
+            ) if persistence_fde > 0 else float("nan"),
             "n_rollouts": int(weights.sum()),
         }
-        for mode in ("persistence", "physics", "hybrid")
-    }
     return per_iceberg, aggregate
 
 
